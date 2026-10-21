@@ -96,7 +96,8 @@ installer or MSIX registration is needed.
   same six-digit code from the P-256 handshake; approving it binds the other
   device's key fingerprint to its peer id. An already trusted device also has
   **Verify device again**, which re-runs the handshake and replaces the pinned
-  fingerprint if the other side legitimately rotated its key. See
+  fingerprint if the other side legitimately rotated its key, and **Forget this
+  device**, which removes the local binding. See
   [Secure pairing](#secure-pairing) below.
 * **Transfers** shows one circular progress ring per file. Pause, resume,
   cancel, dismiss, and *Show in folder* are available as the transfer allows.
@@ -174,6 +175,11 @@ binds the authenticated peer id to it; later transfers pin the key and
 auto-confirm only when the fingerprint is already trusted. Legacy
 `trustedPeers` entries from older builds are ignored because an unauthenticated
 id proves nothing.
+
+**Forget this device** removes the selected device's peer-id-to-fingerprint
+binding and revokes the fingerprint when no other peer uses it. The identity key
+is kept, so a later connection shows the SAS again. Trust is stored locally on
+each side; repeat the action on the other device for a full unpair.
 
 Explicit pairing uses the same handshake over the transfer port, with a
 pairing-only preamble. The receiver reports a verified device without

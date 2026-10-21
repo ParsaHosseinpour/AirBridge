@@ -231,6 +231,11 @@ An id is trusted only while it is bound to a trusted fingerprint, so a device
 that reuses another device's advertised id cannot inherit its trust. Verified
 peers get a mint ring and a check badge in the radar and in the peer sheet.
 
+**Forget this device** in the peer sheet removes the id-to-fingerprint binding
+and revokes the fingerprint on this phone when no other peer uses it. The
+identity key is kept, so the next connection requires a fresh SAS comparison.
+Trust is local; repeat the action on the other device for a full unpair.
+
 ## Permissions
 
 Declared in `app/src/main/AndroidManifest.xml`:

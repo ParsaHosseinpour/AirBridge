@@ -470,6 +470,10 @@ authenticated end to end:
 - **Explicit pairing.** A pairing-only connection uses the same handshake and
   port. The receiver surfaces the SAS, reports a verified device, and re-arms
   without offering or saving a file.
+- **Local unpairing.** **Forget this device** removes the peer-id-to-fingerprint
+  binding and revokes the fingerprint on the current device. The identity key is
+  kept, so the next connection requires a fresh SAS comparison. Trust is local,
+  so the same action must be repeated on the other device for a full unpair.
 - **Anonymous payload metadata.** The wire format carries no filename. Received
   files are staged in the app's private cache, shown for consent, and committed
   under a generated name with an extension guessed from content. The sender's
@@ -504,7 +508,6 @@ Platform-specific details live in [`android/README.md`](android/README.md) and
 - Add `libcore_transfer`: multi-file manifests, queueing, and orchestration.
 - Extend bindings to iOS/macOS, where the `staticlib`/`dylib` artifacts already
   build.
-- Add an explicit device-management screen for revoking remembered fingerprints.
 
 ## Contributing
 

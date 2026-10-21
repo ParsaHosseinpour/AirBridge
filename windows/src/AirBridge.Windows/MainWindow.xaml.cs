@@ -290,6 +290,43 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private async void OnForgetPeerClick(object sender, RoutedEventArgs args)
+    {
+        var peer = _viewModel.SelectedPeer;
+        if (peer is null || RootGrid.XamlRoot is null)
+        {
+            return;
+        }
+
+        await _dialogs.WaitAsync();
+        try
+        {
+            var dialog = new ContentDialog
+            {
+                Title = $"Forget {peer.Name}?",
+                Content = "This removes the verified key from this PC. The next connection will ask you to compare a code again. Forget the device on the other side too to fully unpair.",
+                PrimaryButtonText = "Forget",
+                CloseButtonText = "Cancel",
+                DefaultButton = ContentDialogButton.Close,
+                XamlRoot = RootGrid.XamlRoot,
+            };
+
+            if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+            {
+                _viewModel.ForgetSelectedPeer();
+            }
+        }
+        catch (Exception error)
+        {
+            AppLog.Error("The forget-device dialog failed.", error);
+            _viewModel.ShowBanner(Format.FriendlyException(error), NoticeSeverity.Error);
+        }
+        finally
+        {
+            _dialogs.Release();
+        }
+    }
+
     private void OnPauseTransferClick(object sender, RoutedEventArgs args)
     {
         if (TransferFrom(sender) is { } item)

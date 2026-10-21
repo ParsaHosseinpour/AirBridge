@@ -17,6 +17,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -105,7 +106,10 @@ fun PeerSheet(
     onSend: () -> Unit,
     onPickFiles: () -> Unit,
     onVerify: () -> Unit,
+    onUnpair: () -> Unit,
 ) {
+    var confirmingForget by remember(peer.idHex) { mutableStateOf(false) }
+
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         containerColor = SurfaceGlass,
@@ -211,6 +215,21 @@ fun PeerSheet(
                 )
             }
 
+            if (peer.isTrusted) {
+                Spacer(Modifier.height(6.dp))
+                TextButton(
+                    onClick = { confirmingForget = true },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        text = "Forget this device",
+                        color = Danger,
+                        fontSize = 12.5.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+            }
+
             Spacer(Modifier.height(14.dp))
             Text(
                 text = "ID ${peer.shortId}",
@@ -221,6 +240,48 @@ fun PeerSheet(
                 modifier = Modifier.fillMaxWidth(),
             )
         }
+    }
+
+    if (confirmingForget) {
+        AlertDialog(
+            onDismissRequest = { confirmingForget = false },
+            title = {
+                Text(
+                    text = "Forget ${peer.name}?",
+                    color = TextPrimary,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            },
+            text = {
+                Text(
+                    text = "This phone will forget the verified key for ${peer.name}. " +
+                        "The next connection will ask you to compare a code again. " +
+                        "Forget it on the other device too to fully unpair.",
+                    color = TextMuted,
+                    fontSize = 12.5.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmingForget = false
+                        onUnpair()
+                    },
+                ) {
+                    Text(
+                        text = "Forget",
+                        color = Danger,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmingForget = false }) {
+                    Text(text = "Cancel", color = TextMuted)
+                }
+            },
+        )
     }
 }
 

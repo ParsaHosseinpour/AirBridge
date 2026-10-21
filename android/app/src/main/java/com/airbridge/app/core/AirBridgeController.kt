@@ -417,6 +417,37 @@ class AirBridgeController(
         }
     }
 
+    /**
+     * Forgets the local trust binding for [peerIdHex].
+     *
+     * The identity key is kept; the next connection from this device must
+     * present the SAS again. Trust is local, so the other device keeps its own
+     * binding until the user forgets this phone there too.
+     */
+    fun unpair(peerIdHex: String): Boolean {
+        if (!preferences.isTrusted(peerIdHex)) return false
+        if (transferJob?.isActive == true) {
+            emit("Wait for the current transfer to finish")
+            return false
+        }
+        if (pairingPeerId?.equals(peerIdHex, ignoreCase = true) == true) {
+            cancelPairing()
+        }
+        val peer = _peers.value.firstOrNull { it.idHex.equals(peerIdHex, ignoreCase = true) }
+        preferences.untrust(peerIdHex)
+        _peers.update { list ->
+            list.map { candidate ->
+                if (candidate.idHex.equals(peerIdHex, ignoreCase = true)) {
+                    candidate.copy(isTrusted = false)
+                } else {
+                    candidate
+                }
+            }
+        }
+        emit("${peer?.name ?: "Device"} forgotten. Forget it on the other device too.")
+        return true
+    }
+
     // ---------------------------------------------------------------- transfers
 
     fun send(peer: NearbyPeer, files: List<SelectedFile>): Boolean {

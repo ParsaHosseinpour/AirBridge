@@ -227,7 +227,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 nameof(SelectedPeerDetail),
                 nameof(SendButtonText),
                 nameof(CanSend),
-                nameof(CanVerifySelectedPeer));
+                nameof(CanVerifySelectedPeer),
+                nameof(CanForgetSelectedPeer));
         }
     }
 
@@ -271,6 +272,9 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     /// </summary>
     public bool CanVerifySelectedPeer =>
         SelectedPeer is { HasAddress: true, IsTrusted: true } && !IsBusy && _nativeReady;
+
+    /// <summary>True when the selected device can have its local trust removed.</summary>
+    public bool CanForgetSelectedPeer => SelectedPeer is { IsTrusted: true } && !IsBusy;
 
     public bool HasStagedFiles
     {
@@ -364,7 +368,10 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         {
             if (SetProperty(ref _isBusy, value))
             {
-                OnPropertiesChanged(nameof(CanSend), nameof(CanVerifySelectedPeer));
+                OnPropertiesChanged(
+                    nameof(CanSend),
+                    nameof(CanVerifySelectedPeer),
+                    nameof(CanForgetSelectedPeer));
             }
         }
     }
@@ -1031,6 +1038,35 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     }
 
     /// <summary>
+    /// Removes the selected device's fingerprint binding from this PC.
+    ///
+    /// The identity key is kept; the next connection must show the SAS again.
+    /// Trust is local, so the other device keeps its own binding until the user
+    /// forgets this PC there too.
+    /// </summary>
+    public void ForgetSelectedPeer()
+    {
+        var peer = SelectedPeer;
+        if (peer is null || !peer.IsTrusted || IsBusy)
+        {
+            return;
+        }
+
+        _settings.Forget(peer.IdHex);
+        _store.Save(_settings);
+        peer.IsTrusted = false;
+        OnPropertiesChanged(
+            nameof(SelectedPeerDetail),
+            nameof(SendButtonText),
+            nameof(CanSend),
+            nameof(CanVerifySelectedPeer),
+            nameof(CanForgetSelectedPeer));
+        ShowBanner(
+            $"{peer.Name} was forgotten on this PC. Forget it on the other device too to fully unpair.",
+            NoticeSeverity.Informational);
+    }
+
+    /// <summary>
     /// Runs a real pairing handshake with <paramref name="peer"/> and stores
     /// trust against the fingerprint of its identity key. Trust is never keyed
     /// by the discovered peer id alone.
@@ -1097,7 +1133,9 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             OnPropertiesChanged(
                 nameof(SelectedPeerDetail),
                 nameof(SendButtonText),
-                nameof(CanSend));
+                nameof(CanSend),
+                nameof(CanVerifySelectedPeer),
+                nameof(CanForgetSelectedPeer));
             ShowBanner($"{peer.Name} is now a verified device.", NoticeSeverity.Success);
             return true;
         }
@@ -1181,7 +1219,12 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             peer.IsTrusted = true;
         }
 
-        OnPropertiesChanged(nameof(SelectedPeerDetail), nameof(SendButtonText), nameof(CanSend));
+        OnPropertiesChanged(
+            nameof(SelectedPeerDetail),
+            nameof(SendButtonText),
+            nameof(CanSend),
+            nameof(CanVerifySelectedPeer),
+            nameof(CanForgetSelectedPeer));
 
         if (!wasTrusted)
         {

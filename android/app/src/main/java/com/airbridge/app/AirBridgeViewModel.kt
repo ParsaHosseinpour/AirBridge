@@ -378,6 +378,17 @@ class AirBridgeViewModel(application: Application) : AndroidViewModel(applicatio
         startPairing(peer, emptyList())
     }
 
+    fun forgetPeer(peer: NearbyPeer) {
+        val controller = _activeController.value
+        if (controller == null) {
+            message("The sharing service is still starting up")
+            return
+        }
+        if (controller.unpair(peer.idHex)) {
+            _peerSheet.value = null
+        }
+    }
+
     private fun startPairing(peer: NearbyPeer, files: List<SelectedFile>) {
         viewModelScope.launch {
             val controller = _activeController.value ?: return@launch

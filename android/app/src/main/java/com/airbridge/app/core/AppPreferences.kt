@@ -155,7 +155,14 @@ class AppPreferences(context: Context) {
         val id = idHex.lowercase(Locale.US)
         val fingerprint = peerFingerprint(id)
         val editor = prefs.edit().remove(KEY_PEER_FINGERPRINT + id)
-        if (fingerprint != null) {
+        if (fingerprint != null &&
+            prefs.all.none { (key, value) ->
+                key.startsWith(KEY_PEER_FINGERPRINT) &&
+                    key != KEY_PEER_FINGERPRINT + id &&
+                    value is String &&
+                    value.equals(fingerprint, ignoreCase = true)
+            }
+        ) {
             val remaining = trustedFingerprints().toMutableSet().apply { remove(fingerprint) }
             editor.putStringSet(KEY_TRUSTED_FINGERPRINTS, remaining)
         }

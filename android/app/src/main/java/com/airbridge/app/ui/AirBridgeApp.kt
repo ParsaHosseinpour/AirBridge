@@ -159,6 +159,7 @@ fun AirBridgeApp(viewModel: AirBridgeViewModel) {
                     onPickFiles()
                 },
                 onVerify = { viewModel.requestVerification(peer) },
+                onUnpair = { viewModel.forgetPeer(peer) },
             )
         }
 

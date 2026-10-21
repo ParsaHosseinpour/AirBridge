@@ -488,6 +488,22 @@
                                         <TextBlock Text="Verify device again" Style="{StaticResource BaseTextStyle}" FontSize="12" />
                                     </StackPanel>
                                 </Button>
+
+                                <Button Style="{StaticResource SecondaryButtonStyle}"
+                                        Click="OnForgetPeerClick"
+                                        HorizontalAlignment="Stretch"
+                                        Visibility="{Binding CanForgetSelectedPeer, Converter={StaticResource BoolToVisibility}}">
+                                    <StackPanel Orientation="Horizontal" Spacing="7">
+                                        <FontIcon Glyph="&#xE74D;"
+                                                  FontFamily="Segoe MDL2 Assets"
+                                                  FontSize="12"
+                                                  Foreground="{StaticResource AirBridgeDangerBrush}" />
+                                        <TextBlock Text="Forget this device"
+                                                   Style="{StaticResource BaseTextStyle}"
+                                                   FontSize="12"
+                                                   Foreground="{StaticResource AirBridgeDangerBrush}" />
+                                    </StackPanel>
+                                </Button>
                             </StackPanel>
                         </Border>
 
