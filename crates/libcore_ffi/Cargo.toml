@@ -1,0 +1,64 @@
+[package]
+name = "libcore_ffi"
+description = "AirBridge UniFFI boundary: Kotlin coroutine flows and C# tasks/events over peer discovery and resumable file transfer."
+version.workspace = true
+edition.workspace = true
+# UniFFI 0.31 requires a recent compiler, and uniffi-bindgen-cs (which targets
+# uniffi 0.31) declares 1.88 as its own floor. Declared per crate so the crypto
+# core keeps its deliberately old MSRV.
+rust-version = "1.88"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories = ["api-bindings", "network-programming"]
+keywords = ["uniffi", "ffi", "android", "bindings", "p2p"]
+
+[lib]
+# `core_ffi` is the artifact name the bindings load:
+#   Android  -> libcore_ffi.so
+#   Windows  -> core_ffi.dll
+#   iOS/macOS-> libcore_ffi.a / libcore_ffi.dylib
+name = "core_ffi"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
+
+[features]
+default = []
+# Builds the `uniffi-bindgen` binary. Kept out of the default build so the
+# shipping library does not compile the bindings generator.
+cli = ["uniffi/cli"]
+
+[dependencies]
+libcore_discovery = { path = "../libcore_discovery" }
+libcore_transport = { path = "../libcore_transport" }
+# The FFI crate owns a single multi-threaded runtime; every async export is
+# spawned onto it, so foreign executors (Kotlin coroutines, .NET Tasks) only
+# ever poll a JoinHandle. `macros` is needed for `select!`.
+tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "sync", "time"] }
+# Pinned to the 0.31 line: the C# binding generator (uniffi-bindgen-cs
+# v0.11.1+v0.31.0) embeds the same metadata version. Bump both together.
+uniffi = { version = "0.31", default-features = false }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+# The workspace forbids `unsafe_code`. This crate is the single, deliberate
+# exception: UniFFI's generated scaffolding necessarily contains `unsafe extern
+# "C"` shims. All hand-written code in `src/` is safe Rust and never touches a
+# raw pointer; the public surface only uses owned `String`, integers and
+# records, so there is no hand-written pointer arithmetic to audit.
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+todo = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"

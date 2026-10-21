@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="airbridge_background">#05070D</color>
+    <color name="airbridge_primary">#5AC8FA</color>
+    <color name="airbridge_icon_background">#07101D</color>
+</resources>

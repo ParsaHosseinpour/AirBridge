@@ -1,0 +1,189 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+    x:Class="AirBridge.Windows.Controls.PeerRadarView"
+    x:Name="Root"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="using:AirBridge.Windows.Controls"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    AllowDrop="True"
+    DragOver="OnDragOver"
+    DragLeave="OnDragLeave"
+    Drop="OnDrop"
+    mc:Ignorable="d">
+
+    <Grid Background="Transparent">
+        <Viewbox Stretch="Uniform" StretchDirection="Both" HorizontalAlignment="Stretch" VerticalAlignment="Stretch">
+            <Grid x:Name="Stage" Width="560" Height="520" Background="Transparent">
+                <!-- atmosphere -->
+                <Ellipse Width="470" Height="470" Fill="{StaticResource CyanGlowBrush}" Opacity="0.55" />
+                <Ellipse Width="260" Height="260" Fill="{StaticResource MintGlowBrush}" Opacity="0.18" />
+
+                <!-- rings -->
+                <Ellipse Width="420" Height="420" Stroke="#22FFFFFF" StrokeThickness="1.2" />
+                <Ellipse Width="344" Height="344" Stroke="#12FFFFFF" StrokeThickness="1" StrokeDashArray="1,5" />
+                <Ellipse Width="268" Height="268" Stroke="#12FFFFFF" StrokeThickness="1" />
+                <Ellipse Width="192" Height="192" Stroke="#10FFFFFF" StrokeThickness="1" />
+
+                <Canvas x:Name="TicksCanvas" Width="560" Height="520" IsHitTestVisible="False" />
+
+                <!-- rotating sweep -->
+                <Path x:Name="SweepPath"
+                      Data="M 280,260 L 280,55 A 205,205 0 0 1 411.8,103 Z"
+                      IsHitTestVisible="False"
+                      Opacity="0.2">
+                    <Path.Fill>
+                        <LinearGradientBrush StartPoint="0.35,0.5" EndPoint="1,0.2">
+                            <GradientStop Color="#005AC8FA" Offset="0" />
+                            <GradientStop Color="#335AC8FA" Offset="0.72" />
+                            <GradientStop Color="#8C5AC8FA" Offset="1" />
+                        </LinearGradientBrush>
+                    </Path.Fill>
+                    <Path.RenderTransform>
+                        <RotateTransform x:Name="SweepRotate" CenterX="280" CenterY="260" />
+                    </Path.RenderTransform>
+                </Path>
+
+                <!-- static blips -->
+                <Ellipse Width="5" Height="5" Fill="#66FFFFFF" HorizontalAlignment="Center" VerticalAlignment="Top" />
+                <Ellipse Width="4" Height="4" Fill="#4DFFFFFF" HorizontalAlignment="Left" VerticalAlignment="Center" Margin="48,0,0,92" />
+                <Ellipse Width="4" Height="4" Fill="#40FFFFFF" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,66,64,0" />
+                <Ellipse Width="3" Height="3" Fill="#33FFFFFF" HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="156,0,0,54" />
+
+                <!-- peers orbit -->
+                <ItemsControl x:Name="PeerItems"
+                              Width="560"
+                              Height="520"
+                              ItemsSource="{Binding ItemsSource, ElementName=Root}">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <controls:RadarPanel RingX="0.33" RingY="0.33" StartAngle="-90" />
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Button Style="{StaticResource PeerBubbleButtonStyle}"
+                                    Click="OnPeerClick"
+                                    AutomationProperties.Name="{Binding AutomationName}"
+                                    ToolTipService.ToolTip="{Binding StatusLine}">
+                                <StackPanel Width="108" Spacing="3">
+                                    <Grid Width="64" Height="64" HorizontalAlignment="Center">
+                                        <Ellipse Width="58" Height="58" Fill="{Binding AvatarBrush}" Stroke="#2EFFFFFF" StrokeThickness="1.5" />
+                                        <Ellipse Width="58" Height="58" Stroke="#FF5AC8FA" StrokeThickness="2" Visibility="{Binding IsSelected, Converter={StaticResource BoolToVisibility}}" />
+                                        <FontIcon Glyph="{Binding Glyph}"
+                                                  FontFamily="Segoe MDL2 Assets"
+                                                  FontSize="22"
+                                                  Foreground="#E6FFFFFF"
+                                                  HorizontalAlignment="Center"
+                                                  VerticalAlignment="Center" />
+                                        <Border Width="18" Height="18"
+                                                CornerRadius="9"
+                                                Background="#FF0A2A24"
+                                                BorderBrush="#FF6EE7C8"
+                                                BorderThickness="1"
+                                                HorizontalAlignment="Right"
+                                                VerticalAlignment="Bottom"
+                                                Visibility="{Binding IsTrusted, Converter={StaticResource BoolToVisibility}}">
+                                            <FontIcon Glyph="&#xE73E;" FontFamily="Segoe MDL2 Assets" FontSize="9" Foreground="#FF6EE7C8" />
+                                        </Border>
+                                    </Grid>
+                                    <TextBlock Text="{Binding Name}"
+                                               Style="{StaticResource BaseTextStyle}"
+                                               FontSize="11"
+                                               FontWeight="SemiBold"
+                                               TextAlignment="Center"
+                                               MaxLines="1" />
+                                    <TextBlock Text="{Binding DeviceLabel}"
+                                               Style="{StaticResource MutedTextStyle}"
+                                               FontSize="9.5"
+                                               TextAlignment="Center" />
+                                </StackPanel>
+                            </Button>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+
+                <!-- central drop target -->
+                <Button Style="{StaticResource PeerBubbleButtonStyle}"
+                        Width="184"
+                        Height="184"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Click="OnBrowseClick"
+                        AutomationProperties.Name="Drop files or choose them to send"
+                        ToolTipService.ToolTip="Drop files here, or click to choose them">
+                    <Grid Width="164" Height="164">
+                        <Ellipse Width="164" Height="164" Fill="{StaticResource CyanGlowBrush}" Opacity="0.9" />
+                        <Border Width="152" Height="152" CornerRadius="76" Background="{StaticResource LogoGradientBrush}" BorderBrush="#33FFFFFF" BorderThickness="1.5">
+                            <StackPanel VerticalAlignment="Center" Spacing="1" Width="126">
+                                <TextBlock x:Name="InitialsText"
+                                           Text="AB"
+                                           FontFamily="Segoe UI Variable Display, Segoe UI"
+                                           FontSize="36"
+                                           FontWeight="SemiBold"
+                                           Foreground="White"
+                                           TextAlignment="Center" />
+                                <TextBlock x:Name="DeviceNameText"
+                                           Text="My PC"
+                                           Style="{StaticResource BaseTextStyle}"
+                                           FontSize="12"
+                                           FontWeight="SemiBold"
+                                           Foreground="#EAF4FF"
+                                           TextAlignment="Center"
+                                           MaxLines="1" />
+                                <TextBlock Text="This device"
+                                           Style="{StaticResource MutedTextStyle}"
+                                           FontSize="9.5"
+                                           TextAlignment="Center" />
+                                <TextBlock x:Name="CenterHintText"
+                                           Text="Click or drop files"
+                                           Style="{StaticResource BaseTextStyle}"
+                                           FontSize="9"
+                                           Foreground="#B39FE7FF"
+                                           TextAlignment="Center"
+                                           Margin="0,4,0,0" />
+                            </StackPanel>
+                        </Border>
+                        <Ellipse x:Name="DropRing"
+                                 Width="160"
+                                 Height="160"
+                                 Stroke="#FF5AC8FA"
+                                 StrokeThickness="2"
+                                 StrokeDashArray="2,3"
+                                 Opacity="0" />
+                        <Border x:Name="StagedBadge"
+                                MinWidth="36"
+                                Height="22"
+                                Padding="8,0"
+                                CornerRadius="11"
+                                Background="#F20C1523"
+                                BorderBrush="#665AC8FA"
+                                BorderThickness="1"
+                                HorizontalAlignment="Center"
+                                VerticalAlignment="Bottom"
+                                Margin="0,0,0,-4"
+                                Visibility="Collapsed">
+                            <TextBlock x:Name="StagedBadgeText"
+                                       Text="0"
+                                       Style="{StaticResource BaseTextStyle}"
+                                       FontSize="10"
+                                       FontWeight="SemiBold"
+                                       Foreground="#FF9FE7FF"
+                                       TextAlignment="Center" />
+                        </Border>
+                    </Grid>
+                </Button>
+
+                <TextBlock x:Name="EmptyHint"
+                           Text="No one nearby yet &#x00B7; keep both devices on the same Wi-Fi"
+                           Style="{StaticResource MutedTextStyle}"
+                           FontSize="10.5"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Bottom"
+                           Margin="0,0,0,4"
+                           TextAlignment="Center" />
+            </Grid>
+        </Viewbox>
+    </Grid>
+</UserControl>

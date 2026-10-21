@@ -1,0 +1,7 @@
+# Pin the toolchain so that every contributor and CI runner compiles the crypto
+# core with identical codegen. Cryptography is one of the few places where
+# "works on my machine" and "works in production" can legitimately diverge.
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

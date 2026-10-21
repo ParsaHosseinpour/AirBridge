@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>AirBridge.Core</AssemblyName>
+    <RootNamespace>AirBridge.Core</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <!-- The generated interoperability layer uses pointers and unsafe blocks. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <!--
+    The generated bindings are produced by scripts/build-windows.* into
+    target/bindings/csharp. Override CoreFfiBindingsDir to compile a copy that
+    lives somewhere else.
+  -->
+  <PropertyGroup>
+    <CoreFfiBindingsDir Condition="'$(CoreFfiBindingsDir)' == ''">$(MSBuildThisFileDirectory)..\..\target\bindings\csharp</CoreFfiBindingsDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="$(CoreFfiBindingsDir)\core_ffi.cs" Link="Generated\core_ffi.cs" />
+  </ItemGroup>
+
+  <Target Name="EnsureCoreFfiBindings" BeforeTargets="CoreCompile" Condition="!Exists('$(CoreFfiBindingsDir)\core_ffi.cs')">
+    <Error Text="The generated UniFFI C# bindings were not found at '$(CoreFfiBindingsDir)\core_ffi.cs'. Run scripts/build-windows.ps1 (or .sh) first, or pass -p:CoreFfiBindingsDir=&lt;directory&gt;." />
+  </Target>
+
+</Project>

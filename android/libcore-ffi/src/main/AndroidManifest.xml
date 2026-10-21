@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The library has no components, permissions or receivers of its own; the
+     manifest exists so AGP can package the AAR. Everything the app must
+     declare (Bluetooth permissions, for example) belongs to the app. -->
+<manifest />

@@ -1,0 +1,26 @@
+[package]
+name = "libcore_discovery"
+description = "AirBridge peer discovery: BLE background advertising/scanning on service UUID 0xFE2C, mDNS/DNS-SD registration and browsing, and an active /24 IPv4 subnet probe with automatic fallback."
+version.workspace = true
+edition.workspace = true
+# hickory-proto 0.26 MSRV. Declared per crate so `libcore_crypto` keeps its
+# own, deliberately older floor.
+rust-version = "1.88"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories = ["network-programming", "asynchronous"]
+keywords = ["p2p", "mdns", "ble", "dns-sd", "discovery"]
+
+[dependencies]
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+hickory-proto = { workspace = true }
+reqwest = { workspace = true }
+socket2 = { workspace = true }
+ring.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread"] }
+
+[lints]
+workspace = true

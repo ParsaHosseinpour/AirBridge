@@ -1,0 +1,25 @@
+[package]
+name = "libcore_transport"
+description = "AirBridge file transport: 4-byte length-prefixed binary framing, a 512 KiB chunk engine with per-chunk SHA-256, and resumable uploads over tokio TCP streams."
+version.workspace = true
+edition.workspace = true
+# tokio 1.x MSRV. Declared per crate so `libcore_crypto` keeps its own,
+# deliberately older floor.
+rust-version = "1.71"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories = ["network-programming", "filesystem"]
+keywords = ["p2p", "framing", "chunked", "resumable", "tcp"]
+
+[dependencies]
+tokio = { workspace = true, features = ["fs", "io-util", "net", "rt", "sync", "time"] }
+# SHA-256 for the chunk checksums. Same root of trust as the crypto core, so
+# the workspace keeps exactly one hashing implementation in its release graph.
+ring.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

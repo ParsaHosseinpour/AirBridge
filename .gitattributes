@@ -1,0 +1,23 @@
+# Normalise text in the repository, but keep platform launchers usable.
+* text=auto
+
+# Shell launchers must stay LF even when checked out on Windows.
+*.sh text eol=lf
+gradlew text eol=lf
+
+# Windows launchers and scripts use CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary assets and native/build outputs (the latter are ignored anyway).
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.jar binary
+*.so binary
+*.dll binary
+*.dylib binary
+*.exe binary

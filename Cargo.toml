@@ -1,0 +1,116 @@
+# AirBridge — cross-platform peer-to-peer file sharing engine.
+#
+# # Layer map
+#
+# | crate                 | responsibility                                   | runtime |
+# |-----------------------|--------------------------------------------------|---------|
+# | `libcore_crypto`      | handshake, key schedule, AEAD frames, SAS        | none    |
+# | `libcore_discovery`   | BLE / mDNS / subnet peer discovery               | tokio   |
+# | `libcore_transport`   | length-prefixed framing, chunked resumable file  | tokio   |
+# |                       | transfer over TCP                                |         |
+# | `libcore_transfer`    | manifests, multi-peer orchestration (future)     | tokio   |
+# | `libcore_ffi`         | UniFFI boundary for Kotlin and C# bindings       | tokio   |
+#
+# `libcore_crypto` is deliberately runtime-agnostic. It is the crate that will
+# eventually sit inside the trusted computing base, so it must not inherit an
+# async executor's threading model, cancellation semantics, or dependency graph.
+# `tokio` is therefore pinned here at the workspace level for the transport and
+# discovery layers, but is *not* a dependency of the crypto core.
+#
+# The async crates carry their own `rust-version` rather than inheriting the
+# workspace floor: the crypto core keeps a deliberately old MSRV (it is
+# embedded in the trusted computing base), while discovery's DNS codec and
+# transport's runtime track modern releases on purpose. `libcore_ffi` is the
+# boundary crate: it owns the one Tokio runtime the foreign executors poll
+# through, and it is the single member allowed `unsafe` (UniFFI scaffolding).
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/libcore_crypto",
+    "crates/libcore_discovery",
+    "crates/libcore_transport",
+    "crates/libcore_ffi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "Apache-2.0"
+repository = "https://github.com/airbridge/airbridge"
+authors = ["AirBridge Contributors"]
+categories = ["cryptography", "network-programming"]
+keywords = ["p2p", "crypto", "ukey2", "ecdh", "aes-gcm"]
+
+[workspace.dependencies]
+# ---------------------------------------------------------------------------
+# Cryptography.
+#
+# `ring` is the single root of trust for this workspace: it supplies P-256
+# ECDH, HKDF-SHA512, SHA-512 and AES-256-GCM. It is the same library family
+# Google builds UKEY2 on, which keeps us close to the reference implementation.
+#
+# `aes-gcm` is intentionally *not* used by any shipping code path. It appears
+# only as a dev-dependency, where it acts as an independent implementation to
+# differentially test our `ring`-based frame format against. Two AEAD
+# implementations in the release graph would be two ways to be wrong.
+# ---------------------------------------------------------------------------
+ring = "0.17"
+subtle = "2"
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+
+# Used only for differential testing; see the note above.
+aes-gcm = "0.10"
+
+# ---------------------------------------------------------------------------
+# Async runtime — transport and discovery layers only.
+# ---------------------------------------------------------------------------
+tokio = { version = "1", default-features = false }
+
+# ---------------------------------------------------------------------------
+# Peer discovery (`libcore_discovery`).
+#
+# `hickory-proto` is the DNS wire-format half of the Hickory DNS project
+# (formerly trust-dns). We use it for DNS-SD record construction, message
+# encoding and message parsing over our own multicast sockets — deliberately
+# *not* the higher-level resolver, which has no mDNS support and would drag a
+# resolver cache into a crate that only ever speaks to the local link. The
+# `mdns` feature unlocks the RFC 6762 cache-flush bit on records.
+hickory-proto = { version = "0.26", features = ["mdns"] }
+#
+# `reqwest` backs the tier-3 /24 probe. Default features are off: the probe
+# is a plain-HTTP LAN request to a peer we have not authenticated yet, so TLS,
+# HTTP/2 and proxy support would be dead weight (and a system-proxy would
+# actively misroute a link-local address).
+reqwest = { version = "0.13", default-features = false }
+
+# Raw multicast socket options (reuse-address, interface binding, TTL).
+# tokio's `UdpSocket` cannot express these at creation time.
+socket2 = "0.6"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+todo = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
+[profile.release]
+# Crypto code is not made meaningfully faster by `lto`-driven inlining past
+# this point, and `panic = "abort"` removes a class of unwind-based
+# information leaks. `overflow-checks` stays on: an integer wrap in a sequence
+# counter or length parser is a security bug, not a performance problem.
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+overflow-checks = true
+debug = "line-tables-only"
+
+[profile.bench]
+overflow-checks = true

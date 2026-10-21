@@ -1,0 +1,73 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>AirBridge.Windows</RootNamespace>
+    <AssemblyName>AirBridge</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x86;x64;ARM64</Platforms>
+    <RuntimeIdentifiers>win-x86;win-x64;win-arm64</RuntimeIdentifiers>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
+
+    <!-- Unpackaged WinUI 3: easier to run from the repository and to ship as a
+         plain folder. The Windows App SDK runtime is bundled so the app starts
+         on a clean machine without a separate runtime installer. -->
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <UseWinUI>true</UseWinUI>
+    <!-- Use the Windows App SDK's own MSIX/PRI MSBuild tasks, which ship in the
+         NuGet package. This keeps `dotnet build` working without the Visual
+         Studio UWP workload (the MrtCore targets depend on its PRI tasks). -->
+    <EnableMsixTooling>true</EnableMsixTooling>
+
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <DefaultLanguage>en-US</DefaultLanguage>
+    <ApplicationIcon />
+    <NeutralLanguage>en-US</NeutralLanguage>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <PublishReadyToRun>false</PublishReadyToRun>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.6.250205002" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.1742" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\bindings\csharp\AirBridge.Core.csproj" />
+  </ItemGroup>
+
+  <!-- The native Rust core. It is copied next to AirBridge.exe, which is where
+       the generated bindings look for the bare name `core_ffi`. The dev-path
+       loader in NativeCore can also find target/release during development. -->
+  <ItemGroup>
+    <None Include="..\..\..\target\release\core_ffi.dll"
+          Link="core_ffi.dll"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest"
+          Condition="Exists('..\..\..\target\release\core_ffi.dll')" />
+  </ItemGroup>
+
+  <!-- Firewall setup ships beside the app so the UI can launch it elevated. -->
+  <ItemGroup>
+    <None Include="..\..\scripts\Setup-Firewall.ps1"
+          Link="scripts\Setup-Firewall.ps1"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\..\scripts\README-Firewall.txt"
+          Link="scripts\README-Firewall.txt"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- Custom XAML pages/controls are picked up by the WinUI default items. -->
+  <ItemGroup>
+    <Compile Update="**\*.cs" />
+  </ItemGroup>
+
+</Project>

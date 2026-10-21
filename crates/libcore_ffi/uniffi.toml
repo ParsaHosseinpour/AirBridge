@@ -1,0 +1,25 @@
+# Bindings generator configuration.
+#
+# `--library` mode reads the API metadata straight out of the compiled
+# cdylib, so `cdylib_name` is normally inferred. It is spelled out here for
+# the standalone (UDL) path and for C# consumers that copy the DLL by hand.
+
+[bindings.kotlin]
+package_name = "com.airbridge.core"
+# `android = true` swaps the JNA cleaner for android.system.SystemCleaner.
+# Left off by default so the same generated sources also work on plain JVM
+# tooling (tests, desktop harnesses). Turn it on in an Android-only build.
+android = false
+# Generated records become immutable `val`s: a peer snapshot must not be
+# mutated after it has been emitted or returned.
+generate_immutable_records = true
+
+[bindings.csharp]
+namespace = "AirBridge.Core"
+global_methods_class_name = "AirBridgeMethods"
+cdylib_name = "core_ffi"
+# uniffi-bindgen-cs emits `internal` symbols by default, which only works if
+# the generated file is compiled into the consuming assembly. Here it is
+# compiled into `AirBridge.Core.dll` next to the hand-written event adapters,
+# and the app references that assembly, so the symbols must be `public`.
+access_modifier = "public"

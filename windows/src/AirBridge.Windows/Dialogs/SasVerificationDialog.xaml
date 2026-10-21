@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ContentDialog
+    x:Class="AirBridge.Windows.Dialogs.SasVerificationDialog"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Style="{StaticResource AirBridgeDialogStyle}"
+    Title="Verify pairing"
+    PrimaryButtonText="PINs match"
+    CloseButtonText="Cancel"
+    DefaultButton="None">
+
+    <Grid Width="420">
+        <StackPanel Spacing="16">
+            <Grid ColumnSpacing="12">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <Grid Width="54" Height="54">
+                    <Ellipse x:Name="PeerAvatar" Width="50" Height="50" Stroke="#2EFFFFFF" StrokeThickness="1.5" />
+                    <FontIcon x:Name="PeerGlyph"
+                              FontFamily="Segoe MDL2 Assets"
+                              FontSize="20"
+                              Foreground="#E6FFFFFF"
+                              HorizontalAlignment="Center"
+                              VerticalAlignment="Center" />
+                </Grid>
+
+                <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="2">
+                    <TextBlock x:Name="PeerNameText"
+                               Style="{StaticResource TitleTextStyle}"
+                               FontSize="17"
+                               MaxLines="1" />
+                    <TextBlock x:Name="PeerDetailText"
+                               Style="{StaticResource MutedTextStyle}"
+                               MaxLines="1" />
+                </StackPanel>
+            </Grid>
+
+            <Border x:Name="PreviewPanel"
+                    Background="#16FFCF70"
+                    BorderBrush="#45FFCF70"
+                    BorderThickness="1"
+                    CornerRadius="14"
+                    Padding="12,10">
+                <Grid ColumnSpacing="10">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <FontIcon Glyph="&#xE7BA;"
+                              FontFamily="Segoe MDL2 Assets"
+                              FontSize="16"
+                              Foreground="{StaticResource AirBridgeAmberBrush}"
+                              VerticalAlignment="Top"
+                              Margin="0,1,0,0" />
+
+                    <StackPanel Grid.Column="1" Spacing="2">
+                        <TextBlock Text="Preview pairing"
+                                   Style="{StaticResource BaseTextStyle}"
+                                   FontSize="12"
+                                   FontWeight="SemiBold"
+                                   Foreground="{StaticResource AirBridgeAmberBrush}" />
+                        <TextBlock x:Name="PreviewBodyText"
+                                   Text="This PIN is generated locally. It does not prove the other device's identity, and no trust is saved for this device."
+                                   Style="{StaticResource BaseTextStyle}"
+                                   FontSize="11.5"
+                                   Foreground="#D9FFE6B8"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <TextBlock x:Name="InstructionText"
+                       Text="Ask the other device to open AirBridge. Both screens should show the same six-digit PIN."
+                       Style="{StaticResource BodyTextStyle}"
+                       Foreground="{StaticResource AirBridgeMutedBrush}"
+                       FontSize="12.5" />
+
+            <Border Background="#FF0A1522"
+                    BorderBrush="#335AC8FA"
+                    BorderThickness="1"
+                    CornerRadius="18"
+                    Padding="20,16">
+                <StackPanel Spacing="4">
+                    <TextBlock x:Name="CodeText"
+                               Text="000 000"
+                               FontFamily="Cascadia Mono, Consolas"
+                               FontSize="36"
+                               FontWeight="SemiBold"
+                               Foreground="{StaticResource AirBridgeCyanSoftBrush}"
+                               CharacterSpacing="240"
+                               TextAlignment="Center"
+                               IsTextSelectionEnabled="True" />
+                    <TextBlock x:Name="ExpiryText"
+                               Text="Expires in 2:00"
+                               Style="{StaticResource MutedTextStyle}"
+                               FontSize="10.5"
+                               TextAlignment="Center" />
+                </StackPanel>
+            </Border>
+
+            <TextBlock x:Name="FooterText"
+                       Text="Approve only if the PIN matches exactly. A mismatch can mean someone is intercepting the connection."
+                       Style="{StaticResource BaseTextStyle}"
+                       FontSize="11"
+                       Foreground="{StaticResource AirBridgeMutedBrush}"
+                       TextWrapping="Wrap"
+                       TextTrimming="None" />
+        </StackPanel>
+    </Grid>
+</ContentDialog>

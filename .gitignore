@@ -1,0 +1,131 @@
+# =============================================================================
+# AirBridge - repository-wide ignore rules
+# =============================================================================
+# Deliberately committed:
+#   Cargo.lock                          reproducible Rust binaries
+#   gradle/wrapper/gradle-wrapper.jar   part of the Gradle wrapper
+#   rust-toolchain.toml                 pins the toolchain for every contributor
+#
+# Never committed (all generated):
+#   target/                             Rust artefacts + UniFFI bindings
+#   **/build/, **/bin/, **/obj/         Gradle, Android and .NET outputs
+#   android/libcore-ffi/src/main/jniLibs/   staged libcore_ffi.so files
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Rust / Cargo
+# -----------------------------------------------------------------------------
+/target/
+/fuzz/target/
+**/*.rs.bk
+**/*.rs.orig
+*.pdb
+*.dSYM/
+*.profraw
+*.profdata
+/coverage/
+lcov.info
+*.lcov
+
+# -----------------------------------------------------------------------------
+# Gradle / Android
+# -----------------------------------------------------------------------------
+.gradle/
+**/.gradle/
+**/build/
+.kotlin/
+**/.kotlin/
+local.properties
+android/captures/
+android/.externalNativeBuild/
+**/.cxx/
+
+# Native libraries staged by scripts/build-android.* from target/<profile>/
+android/libcore-ffi/src/main/jniLibs/
+
+# Android build outputs that can escape build/ (IDE exports, ad-hoc signing)
+*.apk
+*.aab
+*.ap_
+*.dex
+*.hprof
+
+# Signing material - never commit keys or keystores
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.snk
+
+# -----------------------------------------------------------------------------
+# .NET / C# / WinUI 3 / Visual Studio
+# -----------------------------------------------------------------------------
+[Bb]in/
+[Oo]bj/
+# Rust binaries live in src/bin; they are source, not .NET output.
+!**/src/bin/
+!**/src/bin/**
+.vs/
+**/.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+*.cache
+*.tlog
+*.binlog
+*.log
+*.trx
+*.coverage
+TestResults/
+.msbuild/
+.nuget/
+*.nupkg
+*.snupkg
+artifacts/
+
+# Windows App SDK / MSIX packaging outputs
+AppPackages/
+BundleArtifacts/
+*.appx
+*.appxbundle
+*.appxupload
+*.msix
+*.msixbundle
+*.msixupload
+*.msi
+
+# -----------------------------------------------------------------------------
+# IDEs and editors (local configuration only)
+# -----------------------------------------------------------------------------
+.idea/
+**/.idea/
+.vscode/
+**/.vscode/
+.fleet/
+.history/
+*.iml
+*.swp
+*.swo
+*~
+
+# -----------------------------------------------------------------------------
+# OS metadata
+# -----------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# -----------------------------------------------------------------------------
+# Local secrets and environment overrides
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+secrets.json
+*.orig
+*.rej
+*.bak

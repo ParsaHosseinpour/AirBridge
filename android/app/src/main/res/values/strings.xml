@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AirBridge</string>
+    <string name="notification_channel_name">Nearby sharing</string>
+    <string name="notification_channel_description">Keeps AirBridge discovering devices and moving files in the background.</string>
+    <string name="notification_title">AirBridge is active</string>
+    <string name="notification_scanning">Visible to nearby devices</string>
+    <string name="notification_starting">Starting nearby discovery…</string>
+    <string name="notification_stopped">Sharing is paused</string>
+    <string name="notification_stop">Stop</string>
+    <string name="notification_connecting">Connecting to %1$s…</string>
+    <string name="notification_sending">Sending %1$s · %2$d%%</string>
+    <string name="notification_receiving">Receiving %1$s · %2$d%%</string>
+    <string name="notification_sending_wait">Sending %1$s…</string>
+    <string name="notification_receiving_wait">Receiving %1$s…</string>
+    <string name="notification_sent">Sent %1$s to %2$s</string>
+    <string name="notification_received">Received %1$s</string>
+    <string name="notification_cancelled">Transfer cancelled</string>
+    <string name="notification_failed">Transfer failed — open AirBridge</string>
+    <string name="notification_needs_attention">Setup needed — open AirBridge</string>
+    <string name="notification_incoming_offer">Incoming file — open AirBridge to accept</string>
+    <string name="notification_incoming">Receiving %1$s · %2$d%%</string>
+    <string name="notification_incoming_wait">Receiving %1$s…</string>
+    <string name="notification_incoming_ready">Received — open AirBridge to save</string>
+    <string name="notification_incoming_saving">Saving to Downloads…</string>
+    <string name="notification_incoming_saved">Saved %1$s to Downloads</string>
+    <string name="notification_incoming_failed">Incoming transfer failed — open AirBridge</string>
+</resources>

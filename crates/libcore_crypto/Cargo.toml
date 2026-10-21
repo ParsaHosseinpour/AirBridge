@@ -1,0 +1,24 @@
+[package]
+name = "libcore_crypto"
+description = "AirBridge protocol cryptography: UKEY2-derived mutual-commitment handshake, HKDF-SHA512 key schedule, AES-256-GCM framing and SAS verification."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[dependencies]
+ring.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+# Independent AEAD implementation, used only to differentially test the frame
+# format. Never linked into a release build of this crate.
+aes-gcm.workspace = true
+
+[lints]
+workspace = true
