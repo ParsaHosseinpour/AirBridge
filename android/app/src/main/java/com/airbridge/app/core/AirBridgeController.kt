@@ -9,21 +9,27 @@ import com.airbridge.app.model.IncomingTransferUi
 import com.airbridge.app.model.NearbyPeer
 import com.airbridge.app.model.SelectedFile
 import com.airbridge.app.model.ShareDirection
+import com.airbridge.app.model.TransferFilePhase
+import com.airbridge.app.model.TransferFileUi
 import com.airbridge.app.model.TransferPhase
 import com.airbridge.app.model.TransferUi
+import com.airbridge.core.BatchEvent
+import com.airbridge.core.BatchItemStatus
+import com.airbridge.core.BatchOptions
+import com.airbridge.core.BatchPhase
+import com.airbridge.core.BatchReport
+import com.airbridge.core.BatchSnapshot
+import com.airbridge.core.BatchTransferSession
 import com.airbridge.core.DiscoveryConfig
 import com.airbridge.core.DiscoveryEvent
 import com.airbridge.core.FfiException
-import com.airbridge.core.FileTransferSession
 import com.airbridge.core.PairingChallenge
 import com.airbridge.core.PairingResult
 import com.airbridge.core.PairingSession
 import com.airbridge.core.PeerDiscoveryEngine
 import com.airbridge.core.PeerIdentity
 import com.airbridge.core.PeerInfo
-import com.airbridge.core.SendOptions
 import com.airbridge.core.SubnetPolicy
-import com.airbridge.core.TransferEvent
 import com.airbridge.core.events
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -102,7 +108,7 @@ class AirBridgeController(
     private var eventJob: Job? = null
     private var refreshJob: Job? = null
     private var transferJob: Job? = null
-    private var activeSession: FileTransferSession? = null
+    private var activeSession: BatchTransferSession? = null
     private var cancelRequested = false
     private var wakeLock: PowerManager.WakeLock? = null
 
@@ -516,134 +522,169 @@ class AirBridgeController(
 
     private suspend fun runSend(peer: NearbyPeer, address: String, files: List<SelectedFile>) {
         acquireWakeLock()
-        try {
-            for ((index, file) in files.withIndex()) {
-                if (cancelRequested) break
-                _transfer.value = TransferUi(
-                    direction = ShareDirection.SENDING,
-                    peerIdHex = peer.idHex,
-                    peerName = peer.name,
-                    fileName = file.name,
-                    totalBytes = file.size.takeIf { it > 0L },
-                    phase = TransferPhase.CONNECTING,
-                    queueIndex = index + 1,
-                    queueSize = files.size,
+        val relativePaths = uniqueRelativePaths(files)
+        val declaredBytes = files.sumOf { it.size.coerceAtLeast(0L) }
+        _transfer.value = TransferUi(
+            direction = ShareDirection.SENDING,
+            peerIdHex = peer.idHex,
+            peerName = peer.name,
+            fileName = if (files.size == 1) files.first().name else "${files.size} files",
+            totalBytes = declaredBytes.takeIf { it > 0L },
+            phase = TransferPhase.PREPARING,
+            files = files.mapIndexed { index, file ->
+                TransferFileUi(
+                    index = index,
+                    relativePath = relativePaths[index],
+                    size = file.size.coerceAtLeast(0L),
                 )
+            },
+        )
 
-                val staged = try {
-                    stageFile(file)
+        var stagingDirectory: File? = null
+        var batchId: ULong? = null
+        try {
+            val staged = try {
+                stagingDirectory = File(appContext.cacheDir, OUTGOING_DIR)
+                    .also { directory ->
+                        if (!directory.exists() && !directory.mkdirs()) {
+                            throw IOException("Could not create the outgoing cache directory")
+                        }
+                    }
+                    .let { directory -> File(directory, "send-${System.nanoTime()}") }
+                    .also { directory ->
+                        if (!directory.mkdirs()) {
+                            throw IOException("Could not create a staging directory")
+                        }
+                    }
+                stageFiles(files, relativePaths, stagingDirectory)
+            } catch (cancelled: SendCancelled) {
+                markCancelled()
+                return
+            } catch (failure: StagingFailure) {
+                markStagingFailure(files, failure)
+                return
+            }
+
+            var attempt = 0
+            var retry: Boolean
+            do {
+                retry = false
+                _transfer.update { current ->
+                    if (current == null || current.phase.isTerminal) {
+                        current
+                    } else {
+                        current.copy(
+                            phase = TransferPhase.CONNECTING,
+                            sas = null,
+                            error = null,
+                        )
+                    }
+                }
+
+                val options = try {
+                    batchOptions(peer, batchId)
                 } catch (c: CancellationException) {
                     throw c
                 } catch (t: Throwable) {
-                    _transfer.update { it?.copy(phase = TransferPhase.FAILED, error = describeFileError(file, t)) }
-                    break
+                    markFailed(describe(t))
+                    return
                 }
 
+                val session = try {
+                    BatchTransferSession.send(address, options)
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (t: Throwable) {
+                    if (cancelRequested || t is FfiException.Cancelled) {
+                        markCancelled()
+                    } else {
+                        markFailed(describe(t))
+                    }
+                    return
+                }
+
+                activeSession = session
+                batchId = session.batchId() ?: batchId
                 try {
-                    if (cancelRequested) break
-                    var connectAttempt = 0
-                    while (!cancelRequested) {
-                        val options = try {
-                            sendOptions(peer)
-                        } catch (t: Throwable) {
-                            _transfer.update { it?.copy(phase = TransferPhase.FAILED, error = describe(t)) }
-                            break
+                    for (entry in staged) {
+                        if (cancelRequested) {
+                            session.cancel()
+                            markCancelled()
+                            return
                         }
-                        val session = try {
-                            FileTransferSession.send(address, staged.absolutePath, options)
+                        session.addFile(entry.path, entry.relativePath)
+                    }
+
+                    if (cancelRequested) {
+                        session.cancel()
+                        markCancelled()
+                        return
+                    }
+
+                    coroutineScope {
+                        val collector = launch {
+                            session.events().collect { event -> onBatchEvent(event, session) }
+                        }
+                        try {
+                            val report = session.run()
+                            applyBatchReport(report)
                         } catch (c: CancellationException) {
                             throw c
                         } catch (t: Throwable) {
-                            _transfer.update { it?.copy(phase = TransferPhase.FAILED, error = describe(t)) }
-                            break
-                        }
-
-                        activeSession = session
-                        var retry = false
-                        try {
-                            coroutineScope {
-                                val collector = launch {
-                                    session.events().collect { event -> onTransferEvent(event) }
-                                }
-                                try {
-                                    val report = session.run()
-                                    if (!cancelRequested) {
-                                        _transfer.update { current ->
-                                            if (current == null) null else current.copy(
-                                                phase = TransferPhase.COMPLETED,
-                                                bytesTransferred = report.totalBytes.toLong(),
-                                                totalBytes = report.totalBytes.toLong()
-                                                    .takeIf { it > 0L } ?: current.totalBytes,
-                                            )
-                                        }
-                                    }
-                                } catch (c: CancellationException) {
-                                    throw c
-                                } catch (t: Throwable) {
-                                    val cancelled = cancelRequested || t is FfiException.Cancelled
-                                    // Pairing and transfers share one listener
-                                    // port. Give a receiver that is re-arming
-                                    // after a pairing-only connection a few
-                                    // chances before failing the card. Never
-                                    // retry once a code was shown or the peer
-                                    // identity was already authenticated.
-                                    retry = !cancelled &&
-                                        t is FfiException.Io &&
-                                        connectAttempt < MAX_CONNECT_RETRIES &&
-                                        session.peerFingerprint() == null &&
-                                        _transfer.value?.sas == null
-                                    if (!retry) {
-                                        _transfer.update { current ->
-                                            if (current == null || current.phase.isTerminal) {
-                                                current
-                                            } else if (cancelled) {
-                                                current.copy(phase = TransferPhase.CANCELLED)
-                                            } else {
-                                                current.copy(phase = TransferPhase.FAILED, error = describe(t))
-                                            }
-                                        }
-                                    }
-                                } finally {
-                                    collector.cancelAndJoin()
-                                }
+                            val cancelled = cancelRequested || t is FfiException.Cancelled
+                            // Pairing and transfers share one listener port.
+                            // Give a receiver that is re-arming after a pairing
+                            // connection a few chances before failing the card.
+                            // Never retry once a code was shown or bytes moved.
+                            val handshakeReached = session.peerFingerprint() != null ||
+                                _transfer.value?.sas != null ||
+                                _transfer.value?.files?.any {
+                                    it.phase != TransferFilePhase.PENDING
+                                } == true
+                            retry = !cancelled &&
+                                t is FfiException.Io &&
+                                attempt < MAX_CONNECT_RETRIES &&
+                                !handshakeReached
+                            if (!retry) {
+                                if (cancelled) markCancelled() else markFailed(describe(t))
                             }
                         } finally {
-                            runCatching { session.close() }
-                            activeSession = null
+                            collector.cancelAndJoin()
                         }
-
-                        if (!retry) break
-                        connectAttempt++
-                        _transfer.update { current ->
-                            if (current == null || current.phase.isTerminal) {
-                                current
-                            } else {
-                                current.copy(
-                                    phase = TransferPhase.CONNECTING,
-                                    sas = null,
-                                    error = null,
-                                )
-                            }
-                        }
-                        delay(CONNECT_RETRY_DELAY_MS)
                     }
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (t: Throwable) {
+                    if (cancelRequested || t is FfiException.Cancelled) {
+                        markCancelled()
+                    } else {
+                        markFailed(describe(t))
+                    }
+                    return
                 } finally {
-                    staged.delete()
+                    activeSession = null
+                    runCatching { session.close() }
                 }
 
-                val phase = _transfer.value?.phase
-                if (phase == TransferPhase.FAILED || phase == TransferPhase.CANCELLED || cancelRequested) {
-                    break
+                if (retry) {
+                    attempt++
+                    delay(CONNECT_RETRY_DELAY_MS)
                 }
-                delay(300)
-            }
+            } while (retry && !cancelRequested)
 
             if (cancelRequested && _transfer.value?.phase?.isTerminal != true) {
-                _transfer.update { it?.copy(phase = TransferPhase.CANCELLED) }
+                markCancelled()
             }
+
             _transfer.value?.let { result ->
                 when (result.phase) {
-                    TransferPhase.COMPLETED -> emit("${result.completedVerb} ${result.fileName}")
+                    TransferPhase.COMPLETED -> {
+                        if (result.isBatch) {
+                            emit("Sent ${result.files.size} files to ${peer.name}")
+                        } else {
+                            emit("${result.completedVerb} ${result.fileName}")
+                        }
+                    }
                     TransferPhase.FAILED -> emit(result.error ?: "Transfer failed")
                     TransferPhase.CANCELLED -> emit("Transfer cancelled")
                     else -> Unit
@@ -651,93 +692,411 @@ class AirBridgeController(
             }
         } finally {
             releaseWakeLock()
+            stagingDirectory?.deleteRecursively()
         }
     }
 
-    private fun onTransferEvent(event: TransferEvent) {
-        _transfer.update { current ->
-            if (current == null) return@update null
-            when (event) {
-                is TransferEvent.Started -> current.copy(
-                    phase = TransferPhase.RUNNING,
-                    totalBytes = event.totalBytes?.toLong() ?: current.totalBytes,
-                    sas = null,
-                )
-                is TransferEvent.VerificationRequired -> current.copy(
-                    phase = TransferPhase.VERIFYING,
-                    sas = event.sas,
-                    peerFingerprint = event.peerFingerprint,
-                )
-                is TransferEvent.PeerVerified -> {
-                    rememberVerifiedPeer(event.peerId, event.peerFingerprint)
-                    current.copy(peerFingerprint = event.peerFingerprint)
-                }
-                is TransferEvent.Progress -> current.copy(
-                    phase = if (current.phase == TransferPhase.CONNECTING) {
-                        TransferPhase.RUNNING
-                    } else {
-                        current.phase
-                    },
-                    bytesTransferred = event.bytesTransferred.toLong(),
-                    totalBytes = event.totalBytes?.toLong() ?: current.totalBytes,
-                )
-                is TransferEvent.Completed -> current.copy(
-                    phase = TransferPhase.COMPLETED,
-                    bytesTransferred = event.report.totalBytes.toLong(),
-                    totalBytes = event.report.totalBytes.toLong().takeIf { it > 0L } ?: current.totalBytes,
-                    sas = null,
-                )
-                is TransferEvent.Failed -> if (current.phase.isTerminal) {
-                    current
-                } else {
-                    current.copy(
-                        phase = TransferPhase.FAILED,
-                        error = event.message.ifBlank { event.kind },
-                        sas = null,
-                    )
-                }
-                TransferEvent.Cancelled -> if (current.phase.isTerminal) {
-                    current
-                } else {
-                    current.copy(phase = TransferPhase.CANCELLED, sas = null)
-                }
-                is TransferEvent.Lagged -> current
-            }
-        }
-    }
-
-    private fun sendOptions(peer: NearbyPeer): SendOptions {
+    private fun batchOptions(peer: NearbyPeer, batchId: ULong?): BatchOptions {
         val pinned = if (preferences.isTrusted(peer.idHex)) {
             preferences.peerFingerprint(peer.idHex)
         } else {
             null
         }
-        return SendOptions(
+        return BatchOptions(
             identityPkcs8 = preferences.identityPkcs8,
-            localPeerId = preferences.peerIdHex,
             trustedPeerFingerprints = preferences.trustedFingerprints().toList(),
+            batchId = batchId,
+            responseTimeoutMs = SEND_RESPONSE_TIMEOUT_MS.toULong(),
+            localPeerId = preferences.peerIdHex,
             expectedPeerFingerprint = pinned,
         )
     }
 
-    private fun stageFile(file: SelectedFile): File {
-        val directory = File(appContext.cacheDir, OUTGOING_DIR)
-        if (!directory.exists() && !directory.mkdirs()) {
-            throw IOException("Could not create the outgoing cache directory")
+    /**
+     * Builds one safe, unique manifest path per selected document.
+     *
+     * Folder selections already carry their folder prefix. Individually picked
+     * files can share a name, so a numeric suffix keeps every manifest entry
+     * unique without flattening the tree.
+     */
+    private fun uniqueRelativePaths(files: List<SelectedFile>): List<String> {
+        val used = mutableSetOf<String>()
+        return files.map { file ->
+            val raw = file.relativePath.replace('\\', '/')
+            val normalized = raw.split('/')
+                .filter { it.isNotBlank() && it != "." && it != ".." }
+                .joinToString("/")
+                .ifBlank { sanitize(file.name) }
+            uniquePath(normalized, used)
         }
-        val target = File(directory, "${System.currentTimeMillis()}_${sanitize(file.name)}")
-        appContext.contentResolver.openInputStream(Uri.parse(file.uriString))?.use { input ->
-            target.outputStream().use { output -> input.copyTo(output, COPY_BUFFER_BYTES) }
-        } ?: throw IOException("The document could not be opened")
-        if (target.length() <= 0L) {
-            target.delete()
-            throw IOException("The document is empty")
-        }
-        return target
     }
 
+    private fun uniquePath(candidate: String, used: MutableSet<String>): String {
+        var path = candidate
+        var counter = 2
+        while (!used.add(path.lowercase(Locale.US))) {
+            val slash = candidate.lastIndexOf('/')
+            val folder = if (slash >= 0) candidate.substring(0, slash + 1) else ""
+            val name = candidate.substring(slash + 1)
+            val dot = name.lastIndexOf('.')
+            val stem = if (dot > 0) name.substring(0, dot) else name
+            val extension = if (dot > 0) name.substring(dot) else ""
+            path = "$folder$stem ($counter)$extension"
+            counter++
+        }
+        return path
+    }
+
+    private fun stageFiles(
+        files: List<SelectedFile>,
+        relativePaths: List<String>,
+        directory: File,
+    ): List<StagedSendFile> {
+        val staged = ArrayList<StagedSendFile>(files.size)
+        files.forEachIndexed { index, file ->
+            if (cancelRequested) throw SendCancelled()
+            val target = File(
+                directory,
+                "${index.toString().padStart(4, '0')}-${sanitize(file.name)}",
+            )
+            try {
+                appContext.contentResolver.openInputStream(Uri.parse(file.uriString))?.use { input ->
+                    target.outputStream().use { output -> input.copyTo(output, COPY_BUFFER_BYTES) }
+                } ?: throw IOException("The document could not be opened")
+                if (target.length() <= 0L) {
+                    throw IOException("The document is empty")
+                }
+                staged += StagedSendFile(
+                    path = target.absolutePath,
+                    relativePath = relativePaths[index],
+                    size = target.length(),
+                )
+            } catch (c: CancellationException) {
+                target.delete()
+                throw c
+            } catch (t: Throwable) {
+                target.delete()
+                throw StagingFailure(index, t)
+            }
+        }
+        return staged
+    }
+
+    private fun onBatchEvent(event: BatchEvent, session: BatchTransferSession) {
+        when (event) {
+            is BatchEvent.Started -> _transfer.update { current ->
+                if (current == null) {
+                    current
+                } else {
+                    current.copy(
+                        phase = TransferPhase.RUNNING,
+                        totalBytes = event.totalBytes.toLong().takeIf { it > 0L }
+                            ?: current.totalBytes,
+                        batchId = event.batchId,
+                        sas = null,
+                    )
+                }
+            }
+            is BatchEvent.VerificationRequired -> _transfer.update { current ->
+                if (current == null || current.phase.isTerminal) {
+                    current
+                } else {
+                    current.copy(
+                        phase = TransferPhase.VERIFYING,
+                        sas = event.sas,
+                        peerFingerprint = event.peerFingerprint,
+                    )
+                }
+            }
+            is BatchEvent.PeerVerified -> {
+                rememberVerifiedPeer(event.peerId, event.peerFingerprint)
+                _transfer.update { current ->
+                    if (current == null) {
+                        current
+                    } else {
+                        current.copy(peerFingerprint = event.peerFingerprint)
+                    }
+                }
+            }
+            is BatchEvent.FileStarted -> _transfer.update { current ->
+                if (current == null || current.phase.isTerminal) {
+                    current
+                } else {
+                    current.copy(
+                        phase = TransferPhase.RUNNING,
+                        sas = null,
+                        files = current.files.map { row ->
+                            if (row.index == event.index.toInt()) {
+                                row.copy(
+                                    size = event.size.toLong().takeIf { it > 0L } ?: row.size,
+                                    bytesTransferred = 0L,
+                                    phase = TransferFilePhase.ACTIVE,
+                                    error = null,
+                                )
+                            } else {
+                                row
+                            }
+                        },
+                    )
+                }
+            }
+            is BatchEvent.Progress -> _transfer.update { current ->
+                if (current == null || current.phase.isTerminal) {
+                    current
+                } else {
+                    val activeIndex = event.currentFileIndex?.toInt()
+                    current.copy(
+                        phase = if (current.phase == TransferPhase.CONNECTING) {
+                            TransferPhase.RUNNING
+                        } else {
+                            current.phase
+                        },
+                        bytesTransferred = event.bytesTransferred.toLong(),
+                        totalBytes = event.totalBytes.toLong().takeIf { it > 0L }
+                            ?: current.totalBytes,
+                        etaMillis = event.estimatedRemainingMs?.toLong(),
+                        files = if (activeIndex == null) {
+                            current.files
+                        } else {
+                            current.files.map { row ->
+                                if (row.index == activeIndex) {
+                                    row.copy(
+                                        size = event.fileSize.toLong().takeIf { it > 0L }
+                                            ?: row.size,
+                                        bytesTransferred = event.fileBytesTransferred.toLong(),
+                                        phase = TransferFilePhase.ACTIVE,
+                                    )
+                                } else {
+                                    row
+                                }
+                            }
+                        },
+                    )
+                }
+            }
+            is BatchEvent.FileCompleted -> _transfer.update { current ->
+                if (current == null) {
+                    current
+                } else {
+                    current.copy(
+                        files = current.files.map { row ->
+                            if (row.index == event.index.toInt()) {
+                                row.copy(
+                                    size = event.size.toLong().takeIf { it > 0L } ?: row.size,
+                                    bytesTransferred = event.size.toLong(),
+                                    phase = TransferFilePhase.COMPLETED,
+                                    error = null,
+                                )
+                            } else {
+                                row
+                            }
+                        },
+                        etaMillis = null,
+                    )
+                }
+            }
+            is BatchEvent.FileFailed -> _transfer.update { current ->
+                if (current == null) {
+                    current
+                } else {
+                    current.copy(
+                        files = current.files.map { row ->
+                            if (row.index == event.index.toInt()) {
+                                row.copy(
+                                    phase = TransferFilePhase.FAILED,
+                                    error = event.message.ifBlank { event.kind },
+                                )
+                            } else {
+                                row
+                            }
+                        },
+                    )
+                }
+            }
+            is BatchEvent.Finished -> applyBatchReport(event.report)
+            is BatchEvent.Failed -> markFailed(
+                event.message.ifBlank { event.kind },
+            )
+            BatchEvent.Cancelled -> markCancelled()
+            is BatchEvent.Lagged -> applyBatchSnapshot(session.snapshot())
+        }
+    }
+
+    private fun applyBatchSnapshot(snapshot: BatchSnapshot) {
+        _transfer.update { current ->
+            if (current == null || current.phase.isTerminal) {
+                current
+            } else {
+                current.copy(
+                    bytesTransferred = snapshot.transferredBytes.toLong(),
+                    totalBytes = snapshot.totalBytes.toLong().takeIf { it > 0L }
+                        ?: current.totalBytes,
+                    etaMillis = snapshot.estimatedRemainingMs?.toLong(),
+                    files = snapshot.items.map { item ->
+                        TransferFileUi(
+                            index = item.index.toInt(),
+                            relativePath = item.relativePath,
+                            size = item.size.toLong(),
+                            bytesTransferred = item.bytesTransferred.toLong(),
+                            phase = item.status.toFilePhase(),
+                            error = item.error,
+                        )
+                    },
+                )
+            }
+        }
+    }
+
+    private fun applyBatchReport(report: BatchReport) {
+        _transfer.update { current ->
+            if (current == null) {
+                current
+            } else {
+                val rows = if (report.files.isEmpty()) {
+                    current.files
+                } else {
+                    report.files.map { item ->
+                        TransferFileUi(
+                            index = item.index.toInt(),
+                            relativePath = item.relativePath,
+                            size = item.size.toLong(),
+                            bytesTransferred = item.bytesTransferred.toLong(),
+                            phase = item.status.toFilePhase(),
+                            error = item.error,
+                        )
+                    }
+                }
+                val completed = report.completedFiles.toInt()
+                val failed = report.failedFiles.toInt()
+                val phase = when {
+                    report.status == BatchPhase.CANCELLED -> TransferPhase.CANCELLED
+                    report.status == BatchPhase.FAILED -> TransferPhase.FAILED
+                    failed > 0 -> TransferPhase.FAILED
+                    else -> TransferPhase.COMPLETED
+                }
+                val error = when {
+                    phase != TransferPhase.FAILED -> null
+                    completed > 0 ->
+                        "$completed of ${report.totalFiles} files sent" +
+                            if (failed > 0) "; $failed failed" else ""
+                    else -> rows.firstOrNull { row ->
+                        row.phase == TransferFilePhase.FAILED
+                    }?.error ?: "The transfer failed"
+                }
+                current.copy(
+                    phase = phase,
+                    files = rows,
+                    totalBytes = report.totalBytes.toLong().takeIf { it > 0L }
+                        ?: current.totalBytes,
+                    bytesTransferred = report.transferredBytes.toLong()
+                        .takeIf { it > 0L } ?: current.bytesTransferred,
+                    etaMillis = null,
+                    sas = null,
+                    batchId = report.batchId,
+                    error = error,
+                )
+            }
+        }
+    }
+
+    private fun markStagingFailure(files: List<SelectedFile>, failure: StagingFailure) {
+        val file = files.getOrNull(failure.index)
+        val message = if (file == null) {
+            describe(failure.cause)
+        } else {
+            describeFileError(file, failure.cause)
+        }
+        _transfer.update { current ->
+            if (current == null) {
+                current
+            } else {
+                current.copy(
+                    phase = TransferPhase.FAILED,
+                    error = message,
+                    sas = null,
+                    files = current.files.map { row ->
+                        when {
+                            row.index == failure.index -> row.copy(
+                                phase = TransferFilePhase.FAILED,
+                                error = message,
+                            )
+                            row.phase == TransferFilePhase.PENDING -> row.copy(
+                                phase = TransferFilePhase.CANCELLED,
+                            )
+                            else -> row
+                        }
+                    },
+                )
+            }
+        }
+        emit(message)
+    }
+
+    private fun markFailed(message: String) {
+        _transfer.update { current ->
+            if (current == null || current.phase.isTerminal) {
+                current
+            } else {
+                current.copy(
+                    phase = TransferPhase.FAILED,
+                    error = message,
+                    sas = null,
+                    etaMillis = null,
+                )
+            }
+        }
+    }
+
+    private fun markCancelled() {
+        _transfer.update { current ->
+            if (current == null || current.phase.isTerminal) {
+                current
+            } else {
+                current.copy(
+                    phase = TransferPhase.CANCELLED,
+                    sas = null,
+                    etaMillis = null,
+                    files = current.files.map { row ->
+                        if (row.phase.isTerminal) {
+                            row
+                        } else {
+                            row.copy(phase = TransferFilePhase.CANCELLED)
+                        }
+                    },
+                )
+            }
+        }
+    }
+
+    private fun BatchItemStatus.toFilePhase(): TransferFilePhase = when (this) {
+        BatchItemStatus.PENDING -> TransferFilePhase.PENDING
+        BatchItemStatus.ACTIVE -> TransferFilePhase.ACTIVE
+        BatchItemStatus.COMPLETED -> TransferFilePhase.COMPLETED
+        BatchItemStatus.FAILED -> TransferFilePhase.FAILED
+        BatchItemStatus.CANCELLED -> TransferFilePhase.CANCELLED
+    }
+
+    private data class StagedSendFile(
+        val path: String,
+        val relativePath: String,
+        val size: Long,
+    )
+
+    private class StagingFailure(
+        val index: Int,
+        override val cause: Throwable,
+    ) : IOException("Could not stage the selected document", cause)
+
+    private class SendCancelled : IOException("The transfer was cancelled")
+
     private fun sanitize(name: String): String {
-        val cleaned = name.replace(Regex("[^A-Za-z0-9._-]"), "_").takeLast(64)
+        val cleaned = name
+            .replace('\\', '/')
+            .substringAfterLast('/')
+            .replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001F]"), "_")
+            .trim()
+            .trimEnd('.')
+            .take(140)
         return cleaned.ifBlank { "airbridge-file" }
     }
 
@@ -793,6 +1152,7 @@ class AirBridgeController(
         val LISTEN_PORT: UShort get() = InboundReceiver.TRANSFER_PORT.toUShort()
         private const val PEER_REFRESH_MS = 2_000L
         private const val WAKELOCK_TIMEOUT_MS = 15L * 60L * 1000L
+        private const val SEND_RESPONSE_TIMEOUT_MS = 90_000L
         private const val COPY_BUFFER_BYTES = 256 * 1024
         private const val OUTGOING_DIR = "outgoing"
         private const val PAIRING_TIMEOUT_MS = 30_000L

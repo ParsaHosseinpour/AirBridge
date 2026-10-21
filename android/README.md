@@ -10,9 +10,11 @@ and AES-256-GCM transport exported by `libcore_ffi`: both devices show a real
 SAS derived from the handshake transcript, and trust is stored against the
 peer's identity-key fingerprint.
 
-Inbound transfers are implemented: the service keeps a Rust receive session
-bound to the transfer port and asks the user before copying a verified payload
-into Downloads. See [Receiving files](#receiving-files).
+Sending and receiving use `BatchTransferSession`, so a selection of files or a
+whole folder travels as one manifest. The service keeps a receive session
+bound to the transfer port, stages each offer privately, asks the user before
+copying verified files into Downloads, and recreates the sender's folder
+structure. See [Receiving files](#receiving-files).
 
 ## Modules
 
@@ -47,17 +49,17 @@ app/src/main/java/com/airbridge/app/
   AirBridgeViewModel.kt           service binding, UI state, pickers, pairing
   core/
     AirBridgeService.kt           foreground service, notification, multicast lock
-    AirBridgeController.kt        Rust discovery engine, BLE, transfer queue
-    InboundReceiver.kt            bound receive sessions, consent, re-arming
-    IncomingFileStore.kt          Downloads/MediaStore commit, sniffing, sidecar hints
+    AirBridgeController.kt        Rust discovery engine, BLE, batch transfer queue
+    InboundReceiver.kt            batch receive sessions, consent, re-arming
+    IncomingFileStore.kt          Downloads/MediaStore commit, relative folders, sniffing
     AndroidBleBackend.kt          advertising/scanning and sighting forwarder
     AppPreferences.kt             stable peer id, identity key, verified fingerprints
     NativeCore.kt                 safe `libcore_ffi.so` availability check
   model/Models.kt                 UI models and formatting helpers
   ui/
-    AirBridgeApp.kt               root composable, file/permission pickers
-    IncomingSheet.kt              inbound consent card and circular progress ring
-    RadarScreen.kt                header, status pills, file shelf, error banner
+    AirBridgeApp.kt               root composable, file/folder/permission pickers
+    IncomingSheet.kt              inbound consent card, per-file list, progress ring
+    RadarScreen.kt                header, status pills, multi-file shelf, error banner
     RadarStage.kt                 radar canvas, peer bubbles, central node
     Sheets.kt                     peer, pairing, profile, permission sheets
     Components.kt                 glass surfaces, buttons, shared drawing helpers
@@ -184,20 +186,29 @@ service still runs; Android simply hides the notification from the drawer.
 
 ### Sending files
 
-1. Pick files with the system document picker, or drag document URIs onto the
-   radar. Read access is persisted with `takePersistableUriPermission`.
-2. Tap a peer. With files selected, the radar sends immediately to a trusted
-   peer, or opens the verification sheet for a new peer. Without files it opens
-   the peer sheet.
-3. Files picked with the system picker keep read access through
-   `takePersistableUriPermission` when the provider grants it. Each file is
-   copied from its content URI into the app cache before the Rust
-   `FileTransferSession` is opened. Multiple files are sent sequentially and the
-   cache copy is deleted afterwards.
-4. The central avatar draws a circular progress ring; the notification mirrors
-   the same state. A partial wake lock is held for the duration of a transfer.
-5. Cancellation calls `FileTransferSession.cancel()` and moves the UI to
-   `CANCELLING` until the session reports its terminal state.
+1. Pick several files with the system document picker, pick a folder with the
+   folder picker, or drag document URIs onto the radar. Read access is persisted
+   with `takePersistableUriPermission`; a picked folder needs only its tree
+   grant, because child documents inherit it.
+2. Folder picks are walked with `DocumentsContract` (500 files and 32 levels
+   per folder) and merged into the shelf up to 1,000 staged files. The picked
+   folder keeps its own name as the top-level relative path, and duplicate
+   files are ignored.
+3. Tap a peer. With a selection, the radar sends immediately to a trusted peer,
+   or opens the verification sheet first. Without files it opens the peer
+   sheet.
+4. Every selection is copied from its content URI into `cacheDir/outgoing`,
+   then sent as **one** `BatchTransferSession`; even a single file uses batch
+   mode. Each entry calls `addFile(path, relativePath)` with its manifest path,
+   not the timestamped cache name. Safe, unique relative paths are generated
+   before staging, and the cache tree is deleted afterwards.
+5. The outgoing card lists every file with its own status, plus combined
+   progress, remaining-file count, and the Rust-provided linear ETA. The
+   notification mirrors the batch, and a partial wake lock is held for its
+   duration.
+6. Cancellation calls `BatchTransferSession.cancel()` and moves the card to
+   `CANCELLING` until Rust reports the terminal batch state. The batch API has
+   no pause primitive.
 
 The Rust `Progress` event counts plaintext payload bytes; the UI still clamps
 the reported ratio to `0..1` for robustness.
@@ -205,23 +216,30 @@ the reported ratio to `0..1` for robustness.
 ### Receiving files
 
 `AirBridgeController` owns an `InboundReceiver` for the whole service lifetime.
-It keeps a `FileTransferSession.receive("0.0.0.0:42517", …)` bound while the
+It keeps a `BatchTransferSession.receive("0.0.0.0:42517", …)` bound while the
 service runs, accepts one peer at a time, and re-arms after each session. The
 transport exposes no pre-accept metadata callback, so the receiver:
 
-1. stages the payload in the private cache (`cacheDir/incoming`);
-2. surfaces an `IncomingTransferUi` as soon as Rust reports `Started`;
-3. shows `IncomingTransferSheet` with Accept/Decline in Compose;
-4. only after consent and end-to-end verification copies the file into public
-   `Downloads/AirBridge` — through `MediaStore.Downloads` on API 29+, and the
-   legacy public directory (with `WRITE_EXTERNAL_STORAGE`) on API 26–28.
+1. creates a fresh staging tree under `cacheDir/incoming` for every offer and
+   lets Rust recreate the manifest's relative paths inside it;
+2. surfaces an `IncomingTransferUi` as soon as the SAS or manifest arrives,
+   already populated with every file row, total bytes, and ETA;
+3. shows `IncomingTransferSheet`, where the user can accept while the batch is
+   still arriving or after it has been fully received;
+4. only after consent and end-to-end verification copies the staged files into
+   public `Downloads/AirBridge`, preserving parent folders — through
+   `MediaStore.Downloads` on API 29+, and the legacy public directory (with
+   `WRITE_EXTERNAL_STORAGE`) on API 26–28.
 
 Declining, or letting the 120-second consent window expire, cancels the Rust
-session and deletes the `.part`/`.part.state` files. A partial wake lock is held
-only while frames are actually arriving. The sheet's ring follows
-`TransferEvent.Progress`; because receive events do not carry the `HELLO` size,
-the adapter reads `total_len` from the transport's `ABRS` resume sidecar and
-stays indeterminate until it is available.
+session and deletes the whole staging tree. The final `BatchReport` is the
+source of truth: per-file results are reconciled with the UI, failed saves can
+be retried, and the card shows exact saved/failed counts. A pairing-only
+connection arrives as a zero-file `Completed` report; it confirms the device
+without offering a transfer. A partial wake lock is held while the batch
+session is running. Progress rows follow
+`BatchEvent.Progress` and `BatchSnapshot`; the sheet's ring stays indeterminate
+until the batch reports a total size.
 
 ### Identity and trust
 
@@ -283,16 +301,27 @@ Pairing uses the same handshake and transfer port as a file transfer. A
 pairing-only connection is surfaced as a verified device and the receiver
 re-arms without offering or saving a file.
 
+Batch manifests are treated as untrusted input. The Rust layer rejects
+absolute paths, `..` components, duplicates, and other unsafe manifest names
+before a session starts. On save, `IncomingFileStore` sanitizes every segment
+again, caps folder depth, and only builds a path below
+`Downloads/AirBridge`, so a hostile sender cannot escape the download folder.
+
 ## Known limitations
 
-### Inbound payload metadata
+### One inbound batch at a time
 
-The AirBridge wire protocol carries no filename, so the consent card says
-"Incoming file" and a timestamped name is generated after the payload is
-verified. Only one inbound offer is handled at a time; a verified file waiting
-for Save/Discard keeps the listener from re-arming. The sender is not asked
-before bytes start arriving — they are confined to the app cache until the
-user accepts.
+Only one inbound offer is handled at a time; a verified batch waiting for
+Save/Discard keeps the listener from re-arming. The sender is not asked before
+bytes start arriving — they are confined to the staging tree in the app cache
+until the user accepts. Declining or timing out removes that tree.
+
+### Both devices need a batch-aware build
+
+Transfers negotiate batch mode. A device still running the earlier single-file
+frontend cannot exchange files with this build, because each side expects a
+batch manifest. Update both ends together; pairing-only connections still work
+between batch-aware builds.
 
 ### Other notes
 

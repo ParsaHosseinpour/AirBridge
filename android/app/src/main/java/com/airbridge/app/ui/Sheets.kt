@@ -105,6 +105,7 @@ fun PeerSheet(
     onDismiss: () -> Unit,
     onSend: () -> Unit,
     onPickFiles: () -> Unit,
+    onPickFolder: () -> Unit,
     onVerify: () -> Unit,
     onUnpair: () -> Unit,
 ) {
@@ -188,7 +189,14 @@ fun PeerSheet(
                     onClick = onPickFiles,
                     modifier = Modifier.fillMaxWidth(),
                 )
-                Spacer(Modifier.height(10.dp))
+                Spacer(Modifier.height(8.dp))
+                SecondaryActionButton(
+                    text = "Choose a folder",
+                    iconRes = R.drawable.ic_folder,
+                    onClick = onPickFolder,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
                 SecondaryActionButton(
                     text = "Verify device",
                     iconRes = R.drawable.ic_lock,
@@ -206,11 +214,18 @@ fun PeerSheet(
                     onClick = onSend,
                     modifier = Modifier.fillMaxWidth(),
                 )
-                Spacer(Modifier.height(10.dp))
+                Spacer(Modifier.height(8.dp))
                 SecondaryActionButton(
                     text = "Add more files",
                     iconRes = R.drawable.ic_add,
                     onClick = onPickFiles,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                SecondaryActionButton(
+                    text = "Add a folder",
+                    iconRes = R.drawable.ic_folder,
+                    onClick = onPickFolder,
                     modifier = Modifier.fillMaxWidth(),
                 )
             }

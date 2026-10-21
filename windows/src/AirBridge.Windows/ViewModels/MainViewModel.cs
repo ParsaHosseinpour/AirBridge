@@ -31,6 +31,8 @@ namespace AirBridge.Windows.ViewModels;
 public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 {
     private const ulong PairingTimeoutMs = 30_000;
+    private const int MaxFolderFiles = 1_000;
+    private const int MaxFolderDepth = 32;
 
     private readonly DispatcherQueue _dispatcher;
     private readonly SettingsStore _store;
@@ -106,6 +108,9 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     /// <summary>Set by the window: opens the file picker and returns the chosen files.</summary>
     public Func<Task<IReadOnlyList<StorageFile>>>? FilePicker { get; set; }
+
+    /// <summary>Set by the window: opens the folder picker and returns the chosen folder.</summary>
+    public Func<Task<StorageFolder?>>? FolderPicker { get; set; }
 
     public event EventHandler? ScrollTransfersIntoView;
 
@@ -651,9 +656,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                         : $"Receiving {item.FileName} from {item.PeerName}.",
                     NoticeSeverity.Informational);
                 break;
-            case TransferPhase.Paused:
-                ShowBanner($"Paused {item.FileName}.", NoticeSeverity.Informational);
-                break;
             case TransferPhase.Cancelled:
                 ShowBanner($"Cancelled {item.FileName}.", NoticeSeverity.Informational);
                 break;
@@ -860,22 +862,13 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public async Task AddFilesAsync(IEnumerable<StorageFile> files)
     {
-        var added = 0;
+        var candidates = new List<StagedFile>();
 
         foreach (var file in files)
         {
             try
             {
-                var staged = await StagedFile.FromStorageFileAsync(file);
-                if (StagedFiles.Any(existing =>
-                        string.Equals(existing.Name, staged.Name, StringComparison.OrdinalIgnoreCase) &&
-                        existing.Size == staged.Size))
-                {
-                    continue;
-                }
-
-                StagedFiles.Add(staged);
-                added++;
+                candidates.Add(await StagedFile.FromStorageFileAsync(file));
             }
             catch (Exception error)
             {
@@ -884,40 +877,79 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             }
         }
 
-        if (added > 0)
+        MergeStagedFiles(candidates);
+    }
+
+    /// <summary>Adds a picked folder recursively, preserving its folder prefix.</summary>
+    public async Task AddFolderAsync(StorageFolder folder)
+    {
+        ArgumentNullException.ThrowIfNull(folder);
+
+        var name = string.IsNullOrWhiteSpace(folder.Name) ? "folder" : folder.Name;
+        var candidates = new List<StagedFile>();
+        var truncated = await EnumerateStorageFolderAsync(folder, name, candidates, 0);
+
+        MergeStagedFiles(candidates, $"{candidates.Count} files from {name} ready to send.");
+
+        if (truncated)
         {
-            ShowBanner($"{added} file{(added == 1 ? string.Empty : "s")} ready to send.", NoticeSeverity.Success);
-        }
-        else if (files.Any())
-        {
-            ShowBanner("Those files are already in the list.", NoticeSeverity.Informational);
+            ShowBanner(
+                $"The folder is too large; only the first {MaxFolderFiles} files were added.",
+                NoticeSeverity.Warning);
         }
     }
 
     public async Task AddFilePathsAsync(IEnumerable<string> paths)
     {
-        var files = new List<StorageFile>();
-
-        foreach (var path in paths)
+        var pathList = paths.ToArray();
+        var (candidates, truncated, warning) = await Task.Run(() =>
         {
-            try
-            {
-                if (Directory.Exists(path))
-                {
-                    ShowBanner("Folders cannot be sent yet \u2014 pick individual files.", NoticeSeverity.Warning);
-                    continue;
-                }
+            var staged = new List<StagedFile>();
+            var wasTruncated = false;
+            string? firstWarning = null;
 
-                var file = await StorageFile.GetFileFromPathAsync(path);
-                files.Add(file);
-            }
-            catch (Exception error)
+            foreach (var path in pathList)
             {
-                AppLog.Warn($"Could not open {path}.", error);
+                try
+                {
+                    if (Directory.Exists(path))
+                    {
+                        var name = Path.GetFileName(Path.TrimEndingDirectorySeparator(path));
+                        if (string.IsNullOrWhiteSpace(name))
+                        {
+                            name = "folder";
+                        }
+
+                        wasTruncated |= EnumerateDirectory(path, name, staged, 0);
+                    }
+                    else if (File.Exists(path))
+                    {
+                        staged.Add(StagedFile.FromPath(path));
+                    }
+                }
+                catch (Exception error)
+                {
+                    AppLog.Warn($"Could not open {path}.", error);
+                    firstWarning ??= $"Could not read {Path.GetFileName(path)}.";
+                }
             }
+
+            return (staged, wasTruncated, warning: firstWarning);
+        }).ConfigureAwait(true);
+
+        if (warning is not null)
+        {
+            ShowBanner(warning, NoticeSeverity.Warning);
         }
 
-        await AddFilesAsync(files);
+        MergeStagedFiles(candidates);
+
+        if (truncated)
+        {
+            ShowBanner(
+                $"The folder is too large; only the first {MaxFolderFiles} files were added.",
+                NoticeSeverity.Warning);
+        }
     }
 
     public void RemoveFile(StagedFile file) => StagedFiles.Remove(file);
@@ -944,6 +976,201 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         {
             AppLog.Warn("The file picker failed.", error);
         }
+    }
+
+    public async Task PickFolderAsync()
+    {
+        var picker = FolderPicker;
+        if (picker is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var folder = await picker();
+            if (folder is not null)
+            {
+                await AddFolderAsync(folder);
+            }
+        }
+        catch (Exception error)
+        {
+            AppLog.Warn("The folder picker failed.", error);
+            ShowBanner(Format.FriendlyException(error), NoticeSeverity.Error);
+        }
+    }
+
+    private void MergeStagedFiles(
+        IReadOnlyList<StagedFile> candidates,
+        string? successMessage = null)
+    {
+        var added = 0;
+
+        foreach (var staged in candidates)
+        {
+            if (StagedFiles.Any(existing => IsSameStagedFile(existing, staged)))
+            {
+                continue;
+            }
+
+            StagedFiles.Add(staged);
+            added++;
+        }
+
+        if (added > 0)
+        {
+            ShowBanner(
+                successMessage ?? $"{added} file{(added == 1 ? string.Empty : "s")} ready to send.",
+                NoticeSeverity.Success);
+        }
+        else if (candidates.Count > 0)
+        {
+            ShowBanner("Those files are already in the list.", NoticeSeverity.Informational);
+        }
+    }
+
+    private static bool IsSameStagedFile(StagedFile left, StagedFile right)
+    {
+        if (!string.IsNullOrWhiteSpace(left.Path) && !string.IsNullOrWhiteSpace(right.Path))
+        {
+            return string.Equals(left.Path, right.Path, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return string.Equals(left.RelativePath, right.RelativePath, StringComparison.OrdinalIgnoreCase) &&
+               left.Size == right.Size;
+    }
+
+    private async Task<bool> EnumerateStorageFolderAsync(
+        StorageFolder folder,
+        string prefix,
+        List<StagedFile> output,
+        int depth)
+    {
+        if (depth > MaxFolderDepth)
+        {
+            return true;
+        }
+
+        const uint pageSize = 100;
+        for (uint start = 0; output.Count < MaxFolderFiles; start += pageSize)
+        {
+            IReadOnlyList<IStorageItem> items;
+            try
+            {
+                items = await folder.GetItemsAsync(start, pageSize);
+            }
+            catch (Exception error)
+            {
+                AppLog.Warn($"Could not read the folder {folder.Path}.", error);
+                return false;
+            }
+
+            if (items.Count == 0)
+            {
+                break;
+            }
+
+            foreach (var item in items)
+            {
+                if (output.Count >= MaxFolderFiles)
+                {
+                    return true;
+                }
+
+                switch (item)
+                {
+                    case StorageFile file:
+                        try
+                        {
+                            output.Add(await StagedFile.FromStorageFileAsync(
+                                file,
+                                $"{prefix}/{file.Name}"));
+                        }
+                        catch (Exception error)
+                        {
+                            AppLog.Warn($"Could not stage {file.Name}.", error);
+                        }
+                        break;
+                    case StorageFolder child:
+                        var childName = string.IsNullOrWhiteSpace(child.Name) ? "folder" : child.Name;
+                        if (await EnumerateStorageFolderAsync(
+                                child,
+                                $"{prefix}/{childName}",
+                                output,
+                                depth + 1))
+                        {
+                            return true;
+                        }
+                        break;
+                }
+            }
+
+            if (items.Count < pageSize)
+            {
+                break;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>Walks a dropped directory, skipping reparse points and loop-prone links.</summary>
+    private static bool EnumerateDirectory(
+        string directory,
+        string prefix,
+        List<StagedFile> output,
+        int depth)
+    {
+        if (depth > MaxFolderDepth || output.Count >= MaxFolderFiles)
+        {
+            return true;
+        }
+
+        try
+        {
+            var info = new DirectoryInfo(directory);
+            if ((info.Attributes & System.IO.FileAttributes.ReparsePoint) != 0)
+            {
+                return false;
+            }
+
+            foreach (var file in info.EnumerateFiles())
+            {
+                if (output.Count >= MaxFolderFiles)
+                {
+                    return true;
+                }
+
+                try
+                {
+                    output.Add(StagedFile.FromPath(file.FullName, $"{prefix}/{file.Name}"));
+                }
+                catch (Exception error)
+                {
+                    AppLog.Warn($"Could not stage {file.FullName}.", error);
+                }
+            }
+
+            foreach (var child in info.EnumerateDirectories())
+            {
+                if ((child.Attributes & System.IO.FileAttributes.ReparsePoint) != 0)
+                {
+                    continue;
+                }
+
+                if (EnumerateDirectory(child.FullName, $"{prefix}/{child.Name}", output, depth + 1))
+                {
+                    return true;
+                }
+            }
+        }
+        catch (Exception error)
+        {
+            AppLog.Warn($"Could not read the folder {directory}.", error);
+        }
+
+        return false;
     }
 
     // -------------------------------------------------------------- transfers
@@ -979,13 +1206,15 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         IsBusy = true;
         try
         {
+            var relativePaths = UniqueManifestPaths(files);
             var outgoing = new List<OutgoingFile>(files.Length);
-            foreach (var file in files)
+            for (var index = 0; index < files.Length; index++)
             {
+                var file = files[index];
                 try
                 {
                     var path = await file.EnsureLocalPathAsync();
-                    outgoing.Add(new OutgoingFile(path, file.Name, file.Size));
+                    outgoing.Add(new OutgoingFile(path, file.Name, file.Size, relativePaths[index]));
                 }
                 catch (Exception error)
                 {
@@ -1011,6 +1240,61 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         {
             IsBusy = false;
         }
+    }
+
+    /// <summary>
+    /// Builds one safe, unique manifest path per staged file.
+    ///
+    /// Folder selections already carry their prefix. Individually picked files
+    /// can share a name, so a numeric suffix keeps every manifest entry unique
+    /// without flattening the tree.
+    /// </summary>
+    private static IReadOnlyList<string> UniqueManifestPaths(IReadOnlyList<StagedFile> files)
+    {
+        var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new string[files.Count];
+
+        for (var index = 0; index < files.Count; index++)
+        {
+            var raw = (string.IsNullOrWhiteSpace(files[index].RelativePath)
+                    ? files[index].Name
+                    : files[index].RelativePath)
+                .Replace('\\', '/');
+
+            var segments = raw
+                .Split('/', StringSplitOptions.RemoveEmptyEntries)
+                .Where(segment => segment is not "." and not "..")
+                .Select(segment => Format.SanitizeFileName(segment, "file"))
+                .ToArray();
+
+            var candidate = segments.Length == 0
+                ? Format.SanitizeFileName(files[index].Name)
+                : string.Join('/', segments);
+
+            result[index] = MakeUniqueManifestPath(candidate, used);
+        }
+
+        return result;
+    }
+
+    private static string MakeUniqueManifestPath(string candidate, HashSet<string> used)
+    {
+        var path = candidate;
+        var counter = 2;
+
+        while (!used.Add(path))
+        {
+            var slash = candidate.LastIndexOf('/');
+            var folder = slash >= 0 ? candidate[..(slash + 1)] : string.Empty;
+            var name = candidate[(slash + 1)..];
+            var dot = name.LastIndexOf('.');
+            var stem = dot > 0 ? name[..dot] : name;
+            var extension = dot > 0 ? name[dot..] : string.Empty;
+            path = $"{folder}{stem} ({counter}){extension}";
+            counter++;
+        }
+
+        return path;
     }
 
     /// <summary>
@@ -1232,10 +1516,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             ShowBanner($"{name} is now a verified device.", NoticeSeverity.Success);
         }
     }
-
-    public void PauseTransfer(TransferItem item) => _coordinator.Pause(item);
-
-    public void ResumeTransfer(TransferItem item) => _coordinator.Resume(item);
 
     public void CancelTransfer(TransferItem item) => _coordinator.Cancel(item);
 

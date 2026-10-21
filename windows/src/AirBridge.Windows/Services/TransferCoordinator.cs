@@ -50,40 +50,47 @@ public sealed class PeerVerifiedEventArgs : EventArgs
 /// <summary>A file ready to leave the device.</summary>
 public sealed class OutgoingFile
 {
-    public OutgoingFile(string path, string name, long size)
+    public OutgoingFile(string path, string name, long size, string relativePath)
     {
         Path = path;
         Name = name;
         Size = size;
+        RelativePath = string.IsNullOrWhiteSpace(relativePath)
+            ? name
+            : relativePath.Replace('\\', '/');
     }
 
     public string Path { get; }
     public string Name { get; }
     public long Size { get; }
+
+    /// <summary>Safe `/`-separated path carried in the batch manifest.</summary>
+    public string RelativePath { get; }
 }
 
 /// <summary>
-/// Owns every <see cref="FileTransferSession"/>: a serial send queue and a
+/// Owns every <see cref="BatchTransferSession"/>: a serial send queue and a
 /// long-lived receive listener.
 ///
-/// The Rust engine runs one session per payload. Sends are therefore queued and
-/// executed one at a time, exactly like the Android frontend. Pause is not an
-/// engine primitive: a pause cancels the running session, the receiver's part
-/// file survives, and resuming builds a new session with the same payload id
-/// so the sender seeks to the receiver's verified prefix instead of
-/// restarting.
+/// Sends and receives are always batch sessions, even for a single file, so
+/// both ends share one manifest/progress protocol. A batch is one card with a
+/// per-file child list. The Rust engine has no pause primitive; cancellation
+/// stops the batch and preserves the receiver's part files for a resume with
+/// the same batch id.
 ///
-/// Incoming transfers carry no filename and no peer identity on the wire, so a
-/// received file is committed under a generated name and then renamed with a
-/// sniffed extension once the digest has been verified.
+/// Incoming batches are written into a private staging directory and are only
+/// moved into Downloads after the manifest has been verified. Relative folder
+/// paths are preserved.
 /// </summary>
 public sealed class TransferCoordinator : IAsyncDisposable
 {
     private const int AcceptTimeoutMs = 120_000;
+    private const int ResponseTimeoutMs = 90_000;
     private const int ReceiverRetryDelayMs = 500;
     private const int ReceiverErrorDelayMs = 5_000;
-
-    private static readonly TimeSpan ProgressInterval = TimeSpan.FromMilliseconds(100);
+    private const int ConnectRetryDelayMs = 600;
+    private const int MaxConnectRetries = 4;
+    private const string StagingDirectoryName = ".airbridge-staging";
 
     private readonly DispatcherQueue _dispatcher;
     private readonly Func<AppSettings> _settings;
@@ -92,14 +99,12 @@ public sealed class TransferCoordinator : IAsyncDisposable
     private readonly SemaphoreSlim _sendSignal = new(0);
     private readonly ConcurrentQueue<TransferItem> _sendQueue = new();
     private readonly object _gate = new();
-    private readonly object _resumeGate = new();
 
     private CancellationTokenSource? _lifetime;
     private Task? _sendWorker;
     private CancellationTokenSource? _receiverCts;
     private Task? _receiverTask;
-    private FileTransferSession? _activeReceiveSession;
-    private TaskCompletionSource<bool>? _resumeSignal;
+    private BatchTransferSession? _activeReceiveSession;
     private string? _lastReceiverError;
     private bool _disposed;
 
@@ -146,7 +151,7 @@ public sealed class TransferCoordinator : IAsyncDisposable
         }
     }
 
-    /// <summary>Queues one send job per file. The files are sent in order.</summary>
+    /// <summary>Queues one batch containing every supplied file.</summary>
     public void EnqueueSend(PeerDevice peer, IReadOnlyList<OutgoingFile> files)
     {
         ArgumentNullException.ThrowIfNull(peer);
@@ -159,59 +164,29 @@ public sealed class TransferCoordinator : IAsyncDisposable
 
         Post(() =>
         {
-            foreach (var file in files)
+            var item = new TransferItem(
+                TransferDirection.Send,
+                files.Count == 1 ? files[0].Name : $"{files.Count} files",
+                files[0].Path,
+                peer.Name,
+                peer.IdHex,
+                peer.PrimaryAddress,
+                isBatch: true);
+
+            item.Outgoing = files;
+            for (var index = 0; index < files.Count; index++)
             {
-                var item = new TransferItem(
-                    TransferDirection.Send,
-                    file.Name,
-                    file.Path,
-                    peer.Name,
-                    peer.IdHex,
-                    peer.PrimaryAddress);
-
-                Transfers.Insert(0, item);
-                _sendQueue.Enqueue(item);
+                item.AddFile(
+                    (uint)index,
+                    files[index].RelativePath,
+                    (ulong)Math.Max(0, files[index].Size));
             }
+
+            item.MarkPreparing();
+            Transfers.Insert(0, item);
+            _sendQueue.Enqueue(item);
+            _sendSignal.Release();
         });
-
-        _sendSignal.Release(files.Count);
-    }
-
-    public void Pause(TransferItem item)
-    {
-        if (item is null || !item.CanPause)
-        {
-            return;
-        }
-
-        item.PauseRequested = true;
-        Post(item.MarkPausing);
-
-        try
-        {
-            item.Session?.Cancel();
-        }
-        catch (Exception error)
-        {
-            AppLog.Warn("Could not pause the transfer session.", error);
-        }
-    }
-
-    public void Resume(TransferItem item)
-    {
-        if (item is null || !item.CanResume)
-        {
-            return;
-        }
-
-        item.PauseRequested = false;
-        item.CancelRequested = false;
-        Post(item.MarkConnecting);
-
-        lock (_resumeGate)
-        {
-            _resumeSignal?.TrySetResult(true);
-        }
     }
 
     public void Cancel(TransferItem item)
@@ -222,13 +197,7 @@ public sealed class TransferCoordinator : IAsyncDisposable
         }
 
         item.CancelRequested = true;
-        item.PauseRequested = false;
         Post(item.MarkCancelling);
-
-        lock (_resumeGate)
-        {
-            _resumeSignal?.TrySetResult(false);
-        }
 
         try
         {
@@ -274,7 +243,7 @@ public sealed class TransferCoordinator : IAsyncDisposable
     {
         CancellationTokenSource? cts;
         Task? task;
-        FileTransferSession? session;
+        BatchTransferSession? session;
 
         lock (_gate)
         {
@@ -376,17 +345,16 @@ public sealed class TransferCoordinator : IAsyncDisposable
             return;
         }
 
-        // Pairing and the file transfer use the same listener port. The
-        // receiver needs a moment to re-arm after a pairing-only connection, so
-        // retry a refused connection a few times before failing the card.
         var connectAttempts = 0;
+        ulong? batchId = null;
 
         while (!token.IsCancellationRequested)
         {
             Post(item.MarkConnecting);
 
-            FileTransferSession? session = null;
-            FileTransferEvents? events = null;
+            BatchTransferSession? session = null;
+            BatchTransferEvents? events = null;
+            var retry = false;
 
             try
             {
@@ -398,118 +366,85 @@ public sealed class TransferCoordinator : IAsyncDisposable
                         "This device's identity is not ready yet. Restart AirBridge and try again.");
                 }
 
-                session = FileTransferSession.Send(
+                var files = item.Outgoing;
+                session = BatchTransferSession.Send(
                     item.Address,
-                    item.SourcePath,
-                    new SendOptions(
+                    new BatchOptions(
                         IdentityPkcs8: identity,
                         TrustedPeerFingerprints: settings.TrustedFingerprints.ToArray(),
-                        PayloadId: item.PayloadId,
-                        ResponseTimeoutMs: 90_000,
+                        BatchId: batchId,
+                        ResponseTimeoutMs: ResponseTimeoutMs,
                         ProgressIntervalMs: 100,
                         LocalPeerId: settings.PeerIdHex ?? string.Empty,
                         ExpectedPeerFingerprint: settings.PeerFingerprint(item.PeerIdHex)));
-            }
-            catch (Exception error)
-            {
-                if (item.CancelRequested)
-                {
-                    Post(item.MarkCancelled);
-                }
-                else
-                {
-                    Post(() => item.MarkFailed(Format.FriendlyException(error)));
-                }
 
-                return;
-            }
+                batchId = session.BatchId() ?? batchId;
 
-            try
-            {
                 var sessionReference = session;
-                Post(() =>
-                {
-                    item.Session = sessionReference;
-                    item.SetPayload(sessionReference.PayloadId());
-                });
+                Post(() => item.Session = sessionReference);
 
-                if (item.PauseRequested)
+                foreach (var file in files)
                 {
-                    // Pause arrived while the session was being created.
-                    session.Cancel();
+                    if (item.CancelRequested)
+                    {
+                        session.Cancel();
+                        break;
+                    }
+
+                    await session.AddFile(file.Path, file.RelativePath).ConfigureAwait(false);
                 }
 
-                events = new FileTransferEvents(session);
-                events.EventReceived += (_, transferEvent) => OnTransferEvent(item, sessionReference, transferEvent);
+                events = new BatchTransferEvents(sessionReference);
+                events.EventReceived += (_, transferEvent) =>
+                    OnBatchEvent(item, sessionReference, transferEvent);
                 events.Start();
 
-                var report = await session.Run().ConfigureAwait(false);
-
+                var report = await sessionReference.Run().ConfigureAwait(false);
                 Post(() =>
                 {
                     if (!item.IsTerminal)
                     {
-                        item.MarkCompleted(report);
+                        item.ApplyBatchReport(report);
                     }
                 });
 
-                Notify(
-                    item.Direction == TransferDirection.Send
-                        ? $"Sent {item.FileName} to {item.PeerName}."
-                        : $"Received {item.FileName}.",
-                    NoticeSeverity.Success);
+                NotifyBatchResult(item, report);
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                Post(item.MarkCancelled);
                 return;
             }
             catch (Exception error)
             {
-                if (item.CancelRequested)
+                if (item.CancelRequested || error is FfiException.Cancelled)
                 {
                     Post(item.MarkCancelled);
                     return;
                 }
 
-                if (item.PauseRequested && error is FfiException.Cancelled)
-                {
-                    Post(item.MarkPaused);
-                    var resumed = await WaitForResumeAsync(token).ConfigureAwait(false);
-                    if (resumed && !item.CancelRequested && !token.IsCancellationRequested)
-                    {
-                        continue;
-                    }
-
-                    Post(item.MarkCancelled);
-                    return;
-                }
-
-                if (error is FfiException.Cancelled)
-                {
-                    Post(item.MarkCancelled);
-                    return;
-                }
-
-                if (!item.CancelRequested &&
-                    item.Phase is TransferPhase.Queued or TransferPhase.Connecting &&
-                    connectAttempts < 4 &&
-                    error is FfiException.Io)
+                // Pairing and transfers share one listener port. Give a
+                // receiver that is re-arming after a pairing connection a few
+                // chances before failing the card. Never retry once a code was
+                // shown or bytes moved.
+                if (error is FfiException.Io &&
+                    connectAttempts < MaxConnectRetries &&
+                    !item.HandshakeReached)
                 {
                     connectAttempts++;
                     AppLog.Info(
-                        $"Retrying connection to {item.Address} ({connectAttempts}/4) after a refused connection.");
-                    try
-                    {
-                        await Task.Delay(600, token).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        Post(item.MarkCancelled);
-                        return;
-                    }
-
-                    continue;
+                        $"Retrying connection to {item.Address} ({connectAttempts}/{MaxConnectRetries}) after a refused connection.");
+                    retry = true;
                 }
-
-                Post(() => item.MarkFailed(Format.FriendlyException(error)));
-                return;
+                else
+                {
+                    Post(() => item.MarkFailed(Format.FriendlyException(error)));
+                    Notify(
+                        $"Could not send to {item.PeerName}: {Format.FriendlyException(error)}",
+                        NoticeSeverity.Error);
+                    return;
+                }
             }
             finally
             {
@@ -528,36 +463,64 @@ public sealed class TransferCoordinator : IAsyncDisposable
                 }
 
                 Post(() => item.Session = null);
-                session.Dispose();
+                session?.Dispose();
+            }
+
+            if (!retry)
+            {
+                return;
+            }
+
+            try
+            {
+                await Task.Delay(ConnectRetryDelayMs, token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
             }
         }
+
+        Post(item.MarkCancelled);
     }
 
-    private Task<bool> WaitForResumeAsync(CancellationToken token)
+    private void NotifyBatchResult(TransferItem item, BatchReport report)
     {
-        TaskCompletionSource<bool> signal;
-        lock (_resumeGate)
+        if (report.Status == BatchPhase.Cancelled)
         {
-            signal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            _resumeSignal = signal;
+            Notify("Transfer cancelled.", NoticeSeverity.Informational);
+            return;
         }
 
-        token.Register(() => signal.TrySetResult(false));
-        return signal.Task;
+        if (report.Status == BatchPhase.Failed || report.FailedFiles > 0)
+        {
+            var verb = item.Direction == TransferDirection.Send ? "sent" : "received";
+            Notify(
+                $"{report.CompletedFiles} of {report.TotalFiles} files {verb}; {report.FailedFiles} failed.",
+                report.CompletedFiles > 0 ? NoticeSeverity.Warning : NoticeSeverity.Error);
+            return;
+        }
+
+        var summary = report.TotalFiles == 1 ? item.FileName : $"{report.TotalFiles} files";
+        Notify(
+            item.Direction == TransferDirection.Send
+                ? $"Sent {summary} to {item.PeerName}."
+                : $"Received {summary}.",
+            NoticeSeverity.Success);
     }
 
-    private void OnTransferEvent(
+    private void OnBatchEvent(
         TransferItem item,
-        FileTransferSession session,
-        TransferEvent transferEvent)
+        BatchTransferSession session,
+        BatchEvent transferEvent)
     {
         switch (transferEvent)
         {
-            case TransferEvent.VerificationRequired verification:
+            case BatchEvent.VerificationRequired verification:
                 Post(() => item.MarkVerifying(verification.Sas, verification.PeerFingerprint));
                 BeginVerification(item, session, verification);
                 break;
-            case TransferEvent.PeerVerified verified:
+            case BatchEvent.PeerVerified verified:
                 Post(() =>
                 {
                     item.ApplyPeerIdentity(verified.PeerId, verified.PeerFingerprint);
@@ -570,56 +533,69 @@ public sealed class TransferCoordinator : IAsyncDisposable
                     this,
                     new PeerVerifiedEventArgs(verified.PeerId, verified.PeerFingerprint));
                 break;
-            case TransferEvent.Started started:
-                Post(() =>
-                {
-                    if (item.IsTerminal)
-                    {
-                        return;
-                    }
-
-                    item.MarkRunning();
-                    if (started.TotalBytes is { } total)
-                    {
-                        item.ApplyProgress(item.BytesTransferred, total);
-                    }
-                });
-                break;
-            case TransferEvent.Progress progress:
-                Post(() =>
-                {
-                    if (item.IsTerminal)
-                    {
-                        return;
-                    }
-
-                    item.MarkRunning();
-                    item.ApplyProgress(progress.BytesTransferred, progress.TotalBytes);
-                });
-                break;
-            case TransferEvent.Completed completed:
+            case BatchEvent.Started started:
                 Post(() =>
                 {
                     if (!item.IsTerminal)
                     {
-                        item.MarkCompleted(completed.Report);
+                        item.ApplyBatchStarted(started.BatchId, started.TotalFiles, started.TotalBytes);
                     }
                 });
                 break;
-            case TransferEvent.Failed failed:
+            case BatchEvent.FileStarted fileStarted:
                 Post(() =>
                 {
                     if (!item.IsTerminal)
                     {
-                        item.MarkFailed(string.IsNullOrWhiteSpace(failed.Message) ? failed.Kind : failed.Message);
+                        item.ApplyFileStarted(fileStarted.Index, fileStarted.RelativePath, fileStarted.Size);
                     }
                 });
                 break;
-            case TransferEvent.Cancelled:
-            case TransferEvent.Lagged:
-                // Cancellation is resolved by the owning send/receive loop so
-                // a pause is not mistaken for a user cancel.
+            case BatchEvent.Progress progress:
+                Post(() =>
+                {
+                    if (!item.IsTerminal)
+                    {
+                        item.ApplyBatchProgress(progress);
+                    }
+                });
                 break;
+            case BatchEvent.FileCompleted fileCompleted:
+                Post(() =>
+                {
+                    if (!item.IsTerminal)
+                    {
+                        item.ApplyFileCompleted(fileCompleted.Index, fileCompleted.Size, fileCompleted.DestinationPath);
+                    }
+                });
+                break;
+            case BatchEvent.FileFailed fileFailed:
+                Post(() =>
+                {
+                    if (!item.IsTerminal)
+                    {
+                        item.ApplyFileFailed(
+                            fileFailed.Index,
+                            string.IsNullOrWhiteSpace(fileFailed.Message) ? fileFailed.Kind : fileFailed.Message);
+                    }
+                });
+                break;
+            case BatchEvent.Finished:
+            case BatchEvent.Cancelled:
+                // Run() resolves with the authoritative report; the send loop
+                // applies it exactly once.
+                break;
+            case BatchEvent.Failed failed:
+                // Run() surfaces the same failure; its catch decides whether
+                // the connection can be retried before the card is terminal.
+                AppLog.Warn($"The outgoing batch failed: {failed.Kind} {failed.Message}");
+                break;
+            case BatchEvent.Lagged:
+            {
+                var snapshot = session.Snapshot();
+                Post(() => item.ApplyBatchSnapshot(snapshot));
+                break;
+            }
         }
     }
 
@@ -629,16 +605,16 @@ public sealed class TransferCoordinator : IAsyncDisposable
     /// </summary>
     private void BeginVerification(
         TransferItem item,
-        FileTransferSession session,
-        TransferEvent.VerificationRequired verification)
+        BatchTransferSession session,
+        BatchEvent.VerificationRequired verification)
     {
         _ = ConfirmVerificationAsync(item, session, verification);
     }
 
     private async Task ConfirmVerificationAsync(
         TransferItem item,
-        FileTransferSession session,
-        TransferEvent.VerificationRequired verification)
+        BatchTransferSession session,
+        BatchEvent.VerificationRequired verification)
     {
         try
         {
@@ -695,6 +671,7 @@ public sealed class TransferCoordinator : IAsyncDisposable
     private async Task ReceiveLoopAsync(CancellationToken token)
     {
         var retryDelay = ReceiverRetryDelayMs;
+        var stagingCleaned = false;
 
         while (!token.IsCancellationRequested)
         {
@@ -710,18 +687,26 @@ public sealed class TransferCoordinator : IAsyncDisposable
                 continue;
             }
 
-            FileTransferSession? session = null;
-            FileTransferEvents? events = null;
-            TransferItem? item = null;
-            var announced = false;
+            if (!stagingCleaned)
+            {
+                CleanupStaleStaging(settings.DownloadDirectory);
+                stagingCleaned = true;
+            }
+
+            BatchTransferSession? session = null;
+            BatchTransferEvents? events = null;
+            string? stagingForCleanup = null;
 
             try
             {
                 Directory.CreateDirectory(settings.DownloadDirectory);
 
-                var destination = Path.Combine(
-                    settings.DownloadDirectory,
-                    $".airbridge-incoming-{Guid.NewGuid():N}.bin");
+                var stagingRoot = Path.Combine(settings.DownloadDirectory, StagingDirectoryName);
+                Directory.CreateDirectory(stagingRoot);
+
+                var stagingPath = Path.Combine(stagingRoot, Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(stagingPath);
+                stagingForCleanup = stagingPath;
 
                 var identity = _identityPkcs8();
                 if (identity is null || identity.Length == 0)
@@ -730,46 +715,48 @@ public sealed class TransferCoordinator : IAsyncDisposable
                         "This device's identity is not ready yet.");
                 }
 
-                session = FileTransferSession.Receive(
+                session = BatchTransferSession.Receive(
                     $"0.0.0.0:{settings.ListenPort}",
-                    destination,
-                    new ReceiveOptions(
+                    stagingPath,
+                    new BatchOptions(
                         IdentityPkcs8: identity,
                         TrustedPeerFingerprints: settings.TrustedFingerprints.ToArray(),
-                        ExpectedPayloadId: null,
                         AckEveryBytes: 4 * 1024 * 1024,
                         VerifyWholeFile: true,
-                        AcceptTimeoutMs: AcceptTimeoutMs,
+                        ResponseTimeoutMs: ResponseTimeoutMs,
                         ProgressIntervalMs: 100,
+                        AcceptTimeoutMs: AcceptTimeoutMs,
                         LocalPeerId: settings.PeerIdHex ?? string.Empty));
 
                 var receiveItem = new TransferItem(
                     TransferDirection.Receive,
-                    "Incoming file",
-                    destination,
+                    "Incoming files",
+                    stagingPath,
                     "Nearby device",
                     string.Empty,
-                    $"port {settings.ListenPort}");
+                    $"port {settings.ListenPort}",
+                    isBatch: true);
 
-                item = receiveItem;
-                receiveItem.Session = session;
+                var sessionReference = session;
+                var announcement = new ReceiverAnnouncement();
 
                 lock (_gate)
                 {
-                    _activeReceiveSession = session;
+                    _activeReceiveSession = sessionReference;
                 }
 
                 SetReceiverListening(true);
                 retryDelay = ReceiverRetryDelayMs;
 
-                events = new FileTransferEvents(session);
+                events = new BatchTransferEvents(sessionReference);
                 events.EventReceived += (_, transferEvent) =>
-                    OnReceiveEvent(receiveItem, session, transferEvent, settings, ref announced);
+                    OnReceiveEvent(receiveItem, sessionReference, transferEvent, announcement);
                 events.Start();
 
+                BatchReport? report = null;
                 try
                 {
-                    await session.Run().ConfigureAwait(false);
+                    report = await sessionReference.Run().ConfigureAwait(false);
                 }
                 catch (FfiException.Timeout)
                 {
@@ -779,17 +766,34 @@ public sealed class TransferCoordinator : IAsyncDisposable
                 {
                     // Either the user cancelled a transfer in flight or the
                     // listener is being restarted.
+                    if (announcement.Announced || IsAuthenticated(sessionReference))
+                    {
+                        Post(() =>
+                        {
+                            EnsureVisible(receiveItem);
+                            receiveItem.MarkCancelled();
+                        });
+                    }
                 }
                 catch (Exception error)
                 {
-                    if (announced)
+                    if (announcement.Announced || IsAuthenticated(sessionReference))
                     {
-                        Post(() => receiveItem.MarkFailed(Format.FriendlyException(error)));
+                        Post(() =>
+                        {
+                            EnsureVisible(receiveItem);
+                            receiveItem.MarkFailed(Format.FriendlyException(error));
+                        });
                     }
                     else
                     {
                         AppLog.Warn("The inbound listener failed before accepting a transfer.", error);
                     }
+                }
+
+                if (report is not null)
+                {
+                    CompleteReceive(receiveItem, sessionReference, stagingPath, report, settings);
                 }
             }
             catch (Exception error) when (error is not OperationCanceledException)
@@ -826,6 +830,11 @@ public sealed class TransferCoordinator : IAsyncDisposable
                 }
 
                 session?.Dispose();
+
+                if (stagingForCleanup is not null)
+                {
+                    TryDeleteDirectory(stagingForCleanup);
+                }
             }
 
             if (!await DelayAsync(retryDelay, token).ConfigureAwait(false))
@@ -839,31 +848,30 @@ public sealed class TransferCoordinator : IAsyncDisposable
 
     private void OnReceiveEvent(
         TransferItem item,
-        FileTransferSession session,
-        TransferEvent transferEvent,
-        AppSettings settings,
-        ref bool announced)
+        BatchTransferSession session,
+        BatchEvent transferEvent,
+        ReceiverAnnouncement announcement)
     {
         switch (transferEvent)
         {
-            case TransferEvent.VerificationRequired verification:
+            case BatchEvent.VerificationRequired verification:
                 // The handshake is complete, so this is a real AirBridge peer.
                 // Show the card while the user compares the SAS.
-                announced = true;
+                announcement.Announced = true;
                 Post(() =>
                 {
-                    if (!Transfers.Contains(item))
-                    {
-                        Transfers.Insert(0, item);
-                    }
-
+                    EnsureVisible(item);
                     item.MarkVerifying(verification.Sas, verification.PeerFingerprint);
                 });
                 BeginVerification(item, session, verification);
                 break;
-            case TransferEvent.PeerVerified verified:
+            case BatchEvent.PeerVerified verified:
+                // The handshake completed, so a later failure is real and
+                // should be visible even if the manifest never started.
+                announcement.Announced = true;
                 Post(() =>
                 {
+                    EnsureVisible(item);
                     item.ApplyPeerIdentity(verified.PeerId, verified.PeerFingerprint);
                     if (_peerNameLookup?.Invoke(verified.PeerId) is { Length: > 0 } name)
                     {
@@ -874,70 +882,72 @@ public sealed class TransferCoordinator : IAsyncDisposable
                     this,
                     new PeerVerifiedEventArgs(verified.PeerId, verified.PeerFingerprint));
                 break;
-            case TransferEvent.Started:
-                // A TCP connection was accepted. Wait for actual payload
-                // progress before showing the transfer: the listener is on a
-                // fixed port and scanners may connect with non-AirBridge data.
-                break;
-            case TransferEvent.Progress progress:
-                if (!announced)
+            case BatchEvent.Started started:
+            {
+                // The manifest is accepted. The snapshot contains every file,
+                // so the card can show the full batch before the first byte.
+                announcement.Announced = true;
+                var startedSnapshot = session.Snapshot();
+                Post(() =>
                 {
-                    announced = true;
-                    Post(() =>
-                    {
-                        if (!Transfers.Contains(item))
-                        {
-                            Transfers.Insert(0, item);
-                        }
-                    });
+                    EnsureVisible(item);
+                    item.ApplyBatchSnapshot(startedSnapshot);
+                    item.ApplyBatchStarted(started.BatchId, started.TotalFiles, started.TotalBytes);
+                });
+                break;
+            }
+            case BatchEvent.FileStarted fileStarted:
+                announcement.Announced = true;
+                Post(() =>
+                {
+                    EnsureVisible(item);
+                    item.ApplyFileStarted(fileStarted.Index, fileStarted.RelativePath, fileStarted.Size);
+                });
+                break;
+            case BatchEvent.Progress progress:
+                if (!announcement.Announced &&
+                    (progress.FilesTotal > 0 || progress.TotalBytes > 0))
+                {
+                    announcement.Announced = true;
+                    Post(() => EnsureVisible(item));
                 }
 
                 Post(() =>
                 {
                     if (!item.IsTerminal)
                     {
-                        item.MarkRunning();
-                        item.ApplyProgress(progress.BytesTransferred, progress.TotalBytes);
+                        item.ApplyBatchProgress(progress);
                     }
                 });
                 break;
-            case TransferEvent.Completed completed when completed.Report.PairingOnly:
-                announced = true;
-                TryDeletePairingArtifacts(item.SourcePath);
+            case BatchEvent.FileCompleted fileCompleted:
                 Post(() =>
                 {
-                    if (!Transfers.Contains(item))
+                    if (!item.IsTerminal)
                     {
-                        Transfers.Insert(0, item);
+                        item.ApplyFileCompleted(
+                            fileCompleted.Index,
+                            fileCompleted.Size,
+                            fileCompleted.DestinationPath);
                     }
-
-                    item.MarkCompleted(completed.Report);
                 });
-
-                Notify("Device verified.", NoticeSeverity.Success);
-                _ = DismissPairingCardAsync(item);
                 break;
-            case TransferEvent.Completed completed:
-                announced = true;
-                var finalPath = CommitReceivedFile(item.SourcePath, completed.Report, settings);
+            case BatchEvent.FileFailed fileFailed:
                 Post(() =>
                 {
-                    if (!Transfers.Contains(item))
+                    if (!item.IsTerminal)
                     {
-                        Transfers.Insert(0, item);
-                    }
-
-                    item.MarkCompleted(completed.Report);
-                    if (finalPath is not null)
-                    {
-                        item.RenameAfterReceive(Path.GetFileName(finalPath), finalPath);
+                        item.ApplyFileFailed(
+                            fileFailed.Index,
+                            string.IsNullOrWhiteSpace(fileFailed.Message) ? fileFailed.Kind : fileFailed.Message);
                     }
                 });
-
-                Notify($"Received {Path.GetFileName(finalPath) ?? item.FileName}.", NoticeSeverity.Success);
                 break;
-            case TransferEvent.Failed failed:
-                if (!announced)
+            case BatchEvent.Finished:
+                // The authoritative report is committed after Run() returns.
+                break;
+            case BatchEvent.Failed failed:
+                if (!announcement.Announced && !IsAuthenticated(session))
                 {
                     // A port scan or another local service connected and sent
                     // bytes that are not an AirBridge frame. Do not turn that
@@ -949,17 +959,139 @@ public sealed class TransferCoordinator : IAsyncDisposable
 
                 Post(() =>
                 {
-                    if (!Transfers.Contains(item))
-                    {
-                        Transfers.Insert(0, item);
-                    }
-
+                    EnsureVisible(item);
                     if (!item.IsTerminal)
                     {
                         item.MarkFailed(string.IsNullOrWhiteSpace(failed.Message) ? failed.Kind : failed.Message);
                     }
                 });
                 break;
+            case BatchEvent.Cancelled:
+                break;
+            case BatchEvent.Lagged:
+            {
+                var snapshot = session.Snapshot();
+                if (!announcement.Announced && snapshot.TotalFiles > 0)
+                {
+                    announcement.Announced = true;
+                    Post(() => EnsureVisible(item));
+                }
+
+                Post(() => item.ApplyBatchSnapshot(snapshot));
+                break;
+            }
+        }
+    }
+
+    private void CompleteReceive(
+        TransferItem item,
+        BatchTransferSession session,
+        string staging,
+        BatchReport report,
+        AppSettings settings)
+    {
+        if (report.TotalFiles == 0 && report.Files.Length == 0 && report.CompletedFiles == 0)
+        {
+            // Pairing and transfers share the listener port. A pairing-only
+            // connection carries no manifest and is a normal outcome.
+            var peerId = session.PeerId();
+            var fingerprint = session.PeerFingerprint();
+            Post(() =>
+            {
+                EnsureVisible(item);
+                item.MarkPairingCompleted(peerId, fingerprint);
+            });
+
+            _lastReceiverError = null;
+            Notify("Device verified.", NoticeSeverity.Success);
+            _ = DismissPairingCardAsync(item);
+            return;
+        }
+
+        if (report.Status == BatchPhase.Cancelled)
+        {
+            Post(() =>
+            {
+                EnsureVisible(item);
+                item.ApplyBatchReport(report);
+            });
+
+            _lastReceiverError = null;
+            Notify("Incoming transfer cancelled.", NoticeSeverity.Informational);
+            return;
+        }
+
+        BatchCommitResult commit;
+        try
+        {
+            commit = CommitReceivedBatch(staging, report, settings);
+        }
+        catch (Exception error)
+        {
+            AppLog.Error("The received batch could not be committed.", error);
+            Post(() =>
+            {
+                EnsureVisible(item);
+                item.MarkFailed(Format.FriendlyException(error));
+            });
+            Notify("Incoming transfer failed.", NoticeSeverity.Error);
+            return;
+        }
+
+        Post(() =>
+        {
+            EnsureVisible(item);
+            item.ApplyBatchReport(report, commit.SavedPaths, commit.Errors);
+        });
+
+        _lastReceiverError = null;
+
+        var saved = commit.SavedPaths.Count;
+        var failed = report.FailedFiles + commit.Errors.Count;
+
+        if (saved == 0)
+        {
+            Notify("Incoming transfer failed.", NoticeSeverity.Error);
+        }
+        else if (failed > 0)
+        {
+            Notify(
+                $"Received {saved} of {report.TotalFiles} files; {failed} failed.",
+                NoticeSeverity.Warning);
+        }
+        else
+        {
+            var first = commit.SavedPaths.Values.FirstOrDefault();
+            var summary = saved == 1 && first is not null
+                ? Path.GetFileName(first)
+                : $"{saved} files";
+            Notify($"Received {summary}.", NoticeSeverity.Success);
+        }
+    }
+
+    private void EnsureVisible(TransferItem item)
+    {
+        if (!Transfers.Contains(item))
+        {
+            Transfers.Insert(0, item);
+        }
+    }
+
+    /// <summary>
+    /// True once the peer completed the authenticated handshake. The event
+    /// pump can lag behind <c>Run()</c>, so failure paths also consult the
+    /// session state before deciding that a connection was just noise.
+    /// </summary>
+    private static bool IsAuthenticated(BatchTransferSession session)
+    {
+        try
+        {
+            return !string.IsNullOrWhiteSpace(session.PeerFingerprint());
+        }
+        catch (Exception error)
+        {
+            AppLog.Warn("Could not read the inbound peer identity.", error);
+            return false;
         }
     }
 
@@ -975,68 +1107,181 @@ public sealed class TransferCoordinator : IAsyncDisposable
         });
     }
 
-    /// <summary>Removes the unused staging file left by a pairing-only accept.</summary>
-    private static void TryDeletePairingArtifacts(string path)
+    private static BatchCommitResult CommitReceivedBatch(
+        string staging,
+        BatchReport report,
+        AppSettings settings)
     {
-        if (string.IsNullOrWhiteSpace(path))
-        {
-            return;
-        }
+        var result = new BatchCommitResult();
 
-        foreach (var candidate in new[] { path, path + ".part", path + ".part.state" })
+        foreach (var item in report.Files)
         {
+            if (item.Status != BatchItemStatus.Completed)
+            {
+                continue;
+            }
+
             try
             {
-                if (File.Exists(candidate))
+                var source = ResolveStagedFile(staging, item);
+                var segments = SafeSegments(item.RelativePath);
+
+                var directory = settings.DownloadDirectory;
+                for (var index = 0; index < segments.Count - 1; index++)
                 {
-                    File.Delete(candidate);
+                    directory = Path.Combine(directory, segments[index]);
                 }
+
+                Directory.CreateDirectory(directory);
+
+                var fileName = segments[^1];
+                var stem = Path.GetFileNameWithoutExtension(fileName);
+                var extension = Path.GetExtension(fileName);
+                if (string.IsNullOrEmpty(stem))
+                {
+                    stem = fileName;
+                    extension = string.Empty;
+                }
+
+                var target = FileKinds.UniquePath(directory, stem, extension);
+                File.Move(source, target);
+                result.SavedPaths[item.Index] = target;
             }
             catch (Exception error)
             {
-                AppLog.Warn($"Could not remove the pairing staging file {candidate}.", error);
+                result.Errors[item.Index] = Format.FriendlyException(error);
+                AppLog.Warn(
+                    $"Could not commit the received file {item.RelativePath}.",
+                    error);
             }
         }
+
+        return result;
     }
 
-    /// <summary>Renames a committed receive with a sniffed extension and a friendly name.</summary>
-    private string? CommitReceivedFile(string committedPath, TransferReport report, AppSettings settings)
+    /// <summary>Finds a verified file inside the private staging tree.</summary>
+    private static string ResolveStagedFile(string staging, BatchItemInfo item)
     {
-        if (report.PairingOnly)
+        var root = Path.GetFullPath(staging);
+
+        if (!string.IsNullOrWhiteSpace(item.DestinationPath))
         {
-            return null;
+            var reported = Path.GetFullPath(item.DestinationPath);
+            if (IsInside(root, reported) && File.Exists(reported))
+            {
+                return reported;
+            }
         }
 
+        var candidate = root;
+        foreach (var segment in SplitRelativePath(item.RelativePath))
+        {
+            candidate = Path.Combine(candidate, segment);
+        }
+
+        candidate = Path.GetFullPath(candidate);
+        if (!IsInside(root, candidate) || !File.Exists(candidate))
+        {
+            throw new IOException("The received file is no longer available.");
+        }
+
+        return candidate;
+    }
+
+    /// <summary>
+    /// Splits a manifest path and applies the second traversal guard at the
+    /// storage boundary. The Rust receiver already validated the components,
+    /// but the commit code must not trust a path just because it arrived from
+    /// the network.
+    /// </summary>
+    private static IReadOnlyList<string> SafeSegments(string relativePath)
+    {
+        var segments = SplitRelativePath(relativePath);
+        if (segments.Count == 0 || segments.Count > 64)
+        {
+            throw new IOException("The received file path is not safe.");
+        }
+
+        var sanitized = new string[segments.Count];
+        for (var index = 0; index < segments.Count; index++)
+        {
+            var name = Format.SanitizeFileName(segments[index], "file");
+            if (IsReservedDeviceName(name))
+            {
+                name = "_" + name;
+            }
+
+            sanitized[index] = name;
+        }
+
+        return sanitized;
+    }
+
+    private static IReadOnlyList<string> SplitRelativePath(string? relativePath)
+    {
+        var parts = (relativePath ?? string.Empty)
+            .Replace('\\', '/')
+            .Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+        foreach (var part in parts)
+        {
+            if (part is "." or ".." || part.Contains(':'))
+            {
+                throw new IOException("The sender used an unsafe file path.");
+            }
+        }
+
+        return parts;
+    }
+
+    private static bool IsReservedDeviceName(string name)
+    {
+        var stem = Path.GetFileNameWithoutExtension(name).ToUpperInvariant();
+        return stem is "CON" or "PRN" or "AUX" or "NUL" ||
+               stem.Length == 4 && stem[..3] is "COM" or "LPT" && stem[3] is >= '1' and <= '9';
+    }
+
+    private static bool IsInside(string root, string candidate)
+    {
+        var prefix = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
+                     Path.DirectorySeparatorChar;
+        return string.Equals(root, candidate, StringComparison.OrdinalIgnoreCase) ||
+               candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void CleanupStaleStaging(string downloadDirectory)
+    {
         try
         {
-            var path = string.IsNullOrWhiteSpace(report.DestinationPath) ? committedPath : report.DestinationPath;
-            if (!File.Exists(path))
+            var root = Path.Combine(downloadDirectory, StagingDirectoryName);
+            if (!Directory.Exists(root))
             {
-                return null;
+                return;
             }
 
-            var directory = Path.GetDirectoryName(path);
-            if (string.IsNullOrWhiteSpace(directory))
+            foreach (var directory in Directory.EnumerateDirectories(root))
             {
-                directory = settings.DownloadDirectory;
+                TryDeleteDirectory(directory);
             }
-
-            var extension = FileKinds.SniffExtension(path);
-            var baseName = Path.GetFileNameWithoutExtension(
-                FileKinds.BuildFriendlyName(report.PayloadId, DateTime.Now, string.Empty));
-            var target = FileKinds.UniquePath(directory, baseName, extension);
-
-            if (!string.Equals(path, target, StringComparison.OrdinalIgnoreCase))
-            {
-                File.Move(path, target);
-            }
-
-            return target;
         }
         catch (Exception error)
         {
-            AppLog.Warn("The received file could not be renamed.", error);
-            return null;
+            AppLog.Warn("Could not clean the inbound staging area.", error);
+        }
+    }
+
+    private static void TryDeleteDirectory(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+            {
+                Directory.Delete(path, true);
+            }
+        }
+        catch (Exception error)
+        {
+            AppLog.Warn($"The staging directory {path} could not be removed.", error);
         }
     }
 
@@ -1084,7 +1329,7 @@ public sealed class TransferCoordinator : IAsyncDisposable
         CancellationTokenSource? lifetime;
         Task? sender;
         Task? receiver;
-        FileTransferSession? session;
+        BatchTransferSession? session;
 
         lock (_gate)
         {
@@ -1152,5 +1397,16 @@ public sealed class TransferCoordinator : IAsyncDisposable
 
         lifetime?.Dispose();
         _sendSignal.Dispose();
+    }
+
+    private sealed class ReceiverAnnouncement
+    {
+        public volatile bool Announced;
+    }
+
+    private sealed class BatchCommitResult
+    {
+        public Dictionary<uint, string> SavedPaths { get; } = new();
+        public Dictionary<uint, string> Errors { get; } = new();
     }
 }

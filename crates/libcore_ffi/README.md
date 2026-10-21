@@ -83,7 +83,9 @@ With `continueOnError = false`, the first failed item stops the batch; entries
 that were never attempted are reported as `Cancelled` rather than left
 pending. The same `VerificationRequired` / `PeerVerified` events and
 `confirmPeer`/`rejectPeer` methods as a single-file session handle first-use
-trust.
+trust. Because explicit pairing and transfers share the listener port,
+`receive()` also accepts a pairing-only handshake and resolves with a
+zero-file `Completed` report, so a long-lived receiver can simply re-arm.
 
 ## Concurrency model
 

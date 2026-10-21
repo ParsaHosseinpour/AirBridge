@@ -7,11 +7,12 @@ committed.
 ```text
 bindings/
   kotlin/
-    src/com/airbridge/core/Events.kt   PeerDiscoveryEngine.events(), FileTransferSession.events()
+    src/com/airbridge/core/Events.kt   discovery, FileTransferSession and BatchTransferSession flows
   csharp/
     AirBridge.Core.csproj              compiles hand-written + generated sources into one assembly
     PeerDiscoveryEvents.cs             .NET event pump over the discovery stream
-    FileTransferEvents.cs              .NET event pump over the transfer stream
+    FileTransferEvents.cs              .NET event pump over the single-file transfer stream
+    BatchTransferEvents.cs             .NET event pump over the batch session stream
 
 target/bindings/kotlin/   (generated, ignored)
 target/bindings/csharp/   (generated, ignored)
@@ -116,7 +117,7 @@ Compile the wrapper assembly once, then reference it from the app:
 dotnet build bindings\csharp\AirBridge.Core.csproj
 ```
 
-`AirBridge.Core.dll` contains the generated interop plus the two event pumps.
+`AirBridge.Core.dll` contains the generated interop plus the three event pumps.
 Copy `core_ffi.dll` next to the app's binaries (or anywhere on the DLL search
 path); the bindings resolve the bare name `core_ffi`.
 
@@ -170,4 +171,20 @@ events.Start();
 
 TransferReport report = await session.Run();
 await events.DisposeAsync();     // pump already ended after the terminal event
+```
+
+Batches follow the same pattern. Add every file with the receiver-visible
+relative path before starting the pump:
+
+```csharp
+var batch = BatchTransferSession.Send(address, new BatchOptions(identity, trustedFingerprints));
+await batch.AddFile(path, "album/one.jpg");
+await batch.AddFile(otherPath, "album/two.jpg");
+
+await using var events = new BatchTransferEvents(batch);
+events.EventReceived += (_, e) => { if (e is BatchEvent.Progress p) Show(p); };
+events.Start();
+
+BatchReport report = await batch.Run();
+await events.DisposeAsync();
 ```

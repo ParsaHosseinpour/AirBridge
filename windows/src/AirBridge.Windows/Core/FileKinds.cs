@@ -81,6 +81,21 @@ public static class FileKinds
         return $"AirBridge {stamp} {payloadId:x8}{extension}";
     }
 
+    /// <summary>Segoe MDL2 glyph for a file category, shared by the file lists.</summary>
+    public static string GlyphFor(string name)
+    {
+        var extension = Path.GetExtension(name).ToLowerInvariant();
+        return extension switch
+        {
+            ".png" or ".jpg" or ".jpeg" or ".gif" or ".webp" or ".heic" or ".bmp" or ".tif" or ".tiff" => "\uEB9F",
+            ".mp4" or ".mov" or ".mkv" or ".avi" or ".webm" or ".m4v" => "\uE714",
+            ".mp3" or ".wav" or ".flac" or ".m4a" or ".aac" or ".ogg" => "\uE8D6",
+            ".zip" or ".7z" or ".rar" or ".tar" or ".gz" => "\uE7B8",
+            ".pdf" => "\uEA90",
+            _ => "\uE8A5",
+        };
+    }
+
     /// <summary>Returns a non-existing path in <paramref name="directory"/>.</summary>
     public static string UniquePath(string directory, string baseName, string extension)
     {

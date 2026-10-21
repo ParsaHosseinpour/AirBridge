@@ -52,6 +52,12 @@ fun AirBridgeApp(viewModel: AirBridgeViewModel) {
         viewModel.addFiles(uris)
     }
 
+    val folderPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree(),
+    ) { uri ->
+        uri?.let(viewModel::addFolder)
+    }
+
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions(),
     ) {
@@ -65,6 +71,7 @@ fun AirBridgeApp(viewModel: AirBridgeViewModel) {
     }
 
     val onPickFiles: () -> Unit = { filePicker.launch(arrayOf("*/*")) }
+    val onPickFolder: () -> Unit = { folderPicker.launch(null) }
 
     LaunchedEffect(Unit) {
         viewModel.messages.collect { message ->
@@ -95,6 +102,7 @@ fun AirBridgeApp(viewModel: AirBridgeViewModel) {
                 transfer = transfer,
                 selectedFiles = selectedFiles,
                 onPickFiles = onPickFiles,
+                onPickFolder = onPickFolder,
                 onPeerClick = viewModel::onPeerTap,
                 onRemoveFile = viewModel::removeFile,
                 onClearFiles = viewModel::clearFiles,
@@ -157,6 +165,10 @@ fun AirBridgeApp(viewModel: AirBridgeViewModel) {
                 onPickFiles = {
                     viewModel.dismissPeerSheet()
                     onPickFiles()
+                },
+                onPickFolder = {
+                    viewModel.dismissPeerSheet()
+                    onPickFolder()
                 },
                 onVerify = { viewModel.requestVerification(peer) },
                 onUnpair = { viewModel.forgetPeer(peer) },

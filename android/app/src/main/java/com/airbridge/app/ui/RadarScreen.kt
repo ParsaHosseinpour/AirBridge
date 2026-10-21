@@ -32,6 +32,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -39,6 +40,9 @@ import com.airbridge.app.R
 import com.airbridge.app.model.DiscoveryUiState
 import com.airbridge.app.model.NearbyPeer
 import com.airbridge.app.model.SelectedFile
+import com.airbridge.app.model.TransferPhase
+import com.airbridge.app.model.TransferFilePhase
+import com.airbridge.app.model.TransferFileUi
 import com.airbridge.app.model.TransferUi
 import com.airbridge.app.model.formatBytes
 import com.airbridge.app.model.formatCount
@@ -60,6 +64,7 @@ fun RadarScreen(
     transfer: TransferUi?,
     selectedFiles: List<SelectedFile>,
     onPickFiles: () -> Unit,
+    onPickFolder: () -> Unit,
     onPeerClick: (NearbyPeer) -> Unit,
     onRemoveFile: (SelectedFile) -> Unit,
     onClearFiles: () -> Unit,
@@ -100,7 +105,9 @@ fun RadarScreen(
 
         Spacer(Modifier.height(10.dp))
 
-        if (selectedFiles.isEmpty()) {
+        if (transfer != null) {
+            OutgoingTransferShelf(transfer = transfer)
+        } else if (selectedFiles.isEmpty()) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -110,6 +117,13 @@ fun RadarScreen(
                     text = "Choose files to send",
                     iconRes = R.drawable.ic_add,
                     onClick = onPickFiles,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                SecondaryActionButton(
+                    text = "Choose a folder",
+                    iconRes = R.drawable.ic_folder,
+                    onClick = onPickFolder,
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Spacer(Modifier.height(10.dp))
@@ -138,19 +152,13 @@ fun RadarScreen(
                 onRemoveFile = onRemoveFile,
                 onClearFiles = onClearFiles,
             )
-            Spacer(Modifier.height(6.dp))
+            Spacer(Modifier.height(2.dp))
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 20.dp),
+                    .padding(horizontal = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(
-                    text = "Tap a nearby device to send",
-                    color = TextMuted,
-                    fontSize = 11.5.sp,
-                )
-                Spacer(Modifier.weight(1f))
                 TextButton(onClick = onPickFiles) {
                     Icon(
                         painter = painterResource(R.drawable.ic_add),
@@ -166,7 +174,31 @@ fun RadarScreen(
                         fontWeight = FontWeight.Medium,
                     )
                 }
+                TextButton(onClick = onPickFolder) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_folder),
+                        contentDescription = null,
+                        tint = PrimaryCyan,
+                        modifier = Modifier.size(14.dp),
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        text = "Add folder",
+                        color = PrimaryCyan,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
             }
+            Text(
+                text = "Tap a nearby device to send",
+                color = TextMuted,
+                fontSize = 11.5.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 2.dp),
+            )
         }
 
         Spacer(Modifier.height(8.dp))
@@ -330,6 +362,174 @@ private fun tierColor(state: TierState): Color = when (state) {
 }
 
 @Composable
+private fun OutgoingTransferShelf(transfer: TransferUi) {
+    if (transfer.files.isEmpty()) return
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 20.dp, end = 20.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = when {
+                    transfer.isBatch -> "${transfer.completedFiles} of ${transfer.files.size} files"
+                    transfer.phase == TransferPhase.COMPLETED -> "File sent"
+                    transfer.phase == TransferPhase.FAILED -> "File not sent"
+                    else -> transfer.files.first().name
+                },
+                color = TextPrimary,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            if (transfer.failedFiles > 0) {
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = "${transfer.failedFiles} failed",
+                    color = Danger,
+                    fontSize = 10.5.sp,
+                )
+            }
+            Spacer(Modifier.weight(1f))
+            transfer.etaText?.let { eta ->
+                Text(
+                    text = eta,
+                    color = PrimaryCyan,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                )
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        LazyRow(
+            modifier = Modifier.fillMaxWidth(),
+            contentPadding = PaddingValues(horizontal = 20.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            items(transfer.files, key = { it.index }) { row ->
+                TransferFileCard(row = row)
+            }
+        }
+    }
+}
+
+@Composable
+private fun TransferFileCard(row: TransferFileUi) {
+    val color = filePhaseColor(row.phase)
+    val fraction = when (row.phase) {
+        TransferFilePhase.PENDING -> 0f
+        TransferFilePhase.ACTIVE -> row.progress ?: 0f
+        TransferFilePhase.COMPLETED -> 1f
+        TransferFilePhase.FAILED, TransferFilePhase.CANCELLED -> row.progress ?: 0f
+    }
+    GlassSurface(
+        modifier = Modifier.width(196.dp),
+        shape = RoundedCornerShape(16.dp),
+    ) {
+        Column(modifier = Modifier.padding(11.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(32.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(color.copy(alpha = 0.12f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        painter = painterResource(
+                            if (row.phase == TransferFilePhase.FAILED) {
+                                R.drawable.ic_warning
+                            } else {
+                                R.drawable.ic_file
+                            },
+                        ),
+                        contentDescription = null,
+                        tint = color,
+                        modifier = Modifier.size(16.dp),
+                    )
+                }
+                Spacer(Modifier.width(9.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = row.name,
+                        color = TextPrimary,
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = row.folder ?: formatBytes(row.size),
+                        color = TextMuted,
+                        fontSize = 9.5.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            Spacer(Modifier.height(9.dp))
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(3.dp)
+                    .clip(CircleShape)
+                    .background(Color.White.copy(alpha = 0.08f)),
+            ) {
+                if (fraction > 0f) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(fraction)
+                            .height(3.dp)
+                            .clip(CircleShape)
+                            .background(color),
+                    )
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = fileStatus(row),
+                    color = color,
+                    fontSize = 10.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                if (row.phase == TransferFilePhase.ACTIVE && row.percent != null) {
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        text = "${row.percent}%",
+                        color = TextMuted,
+                        fontSize = 10.sp,
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun fileStatus(row: TransferFileUi): String = when (row.phase) {
+    TransferFilePhase.PENDING -> "Waiting"
+    TransferFilePhase.ACTIVE -> "Sending…"
+    TransferFilePhase.COMPLETED -> "Sent"
+    TransferFilePhase.FAILED -> row.error ?: "Failed"
+    TransferFilePhase.CANCELLED -> "Cancelled"
+}
+
+private fun filePhaseColor(phase: TransferFilePhase): Color = when (phase) {
+    TransferFilePhase.PENDING -> TextMuted
+    TransferFilePhase.ACTIVE -> PrimaryCyan
+    TransferFilePhase.COMPLETED -> Mint
+    TransferFilePhase.FAILED -> Danger
+    TransferFilePhase.CANCELLED -> TextMuted
+}
+
+@Composable
 private fun FileShelf(
     files: List<SelectedFile>,
     onRemoveFile: (SelectedFile) -> Unit,
@@ -411,9 +611,12 @@ private fun FileCard(file: SelectedFile, onRemove: () -> Unit) {
                 )
                 Spacer(Modifier.height(2.dp))
                 Text(
-                    text = formatBytes(file.size),
+                    text = file.folder?.let { folder -> "$folder · ${formatBytes(file.size)}" }
+                        ?: formatBytes(file.size),
                     color = TextMuted,
                     fontSize = 10.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
             IconButton(

@@ -86,3 +86,28 @@ public fun FileTransferSession.events(): Flow<TransferEvent> = flow {
         }
     }
 }
+
+/**
+ * Streams [BatchEvent]s from a [BatchTransferSession] as a cold [Flow].
+ *
+ * The session is driven by [BatchTransferSession.run], which resolves with the
+ * final [BatchReport], while this flow carries the throttled per-file progress
+ * samples and the terminal event. The flow completes after [BatchEvent.Finished],
+ * [BatchEvent.Failed] or [BatchEvent.Cancelled]; collect one flow per session.
+ *
+ * [BatchEvent.Lagged] means the event ring dropped samples. Re-read
+ * [BatchTransferSession.snapshot] for the authoritative queue state rather
+ * than reconstructing it from the stream.
+ */
+public fun BatchTransferSession.events(): Flow<BatchEvent> = flow {
+    while (true) {
+        val event = nextEvent() ?: break
+        emit(event)
+        when (event) {
+            is BatchEvent.Finished,
+            is BatchEvent.Failed,
+            BatchEvent.Cancelled -> break
+            else -> Unit
+        }
+    }
+}

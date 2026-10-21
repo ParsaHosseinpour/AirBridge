@@ -431,6 +431,12 @@
                                                                    Style="{StaticResource BaseTextStyle}"
                                                                    FontSize="11"
                                                                    MaxLines="1" />
+                                                        <TextBlock Text="{Binding Folder}"
+                                                                   Style="{StaticResource MutedTextStyle}"
+                                                                   FontSize="8.5"
+                                                                   MaxLines="1"
+                                                                   TextTrimming="CharacterEllipsis"
+                                                                   Visibility="{Binding Folder, Converter={StaticResource StringToVisibility}}" />
                                                         <TextBlock Text="{Binding SizeText}"
                                                                    Style="{StaticResource MutedTextStyle}"
                                                                    FontSize="9" />
@@ -457,9 +463,10 @@
                                         Visibility="{Binding HasStagedFiles, Converter={StaticResource InverseBoolToVisibility}}">
                                     <StackPanel Orientation="Horizontal" Spacing="9">
                                         <FontIcon Glyph="&#xE898;" FontFamily="Segoe MDL2 Assets" FontSize="13" Foreground="{StaticResource AirBridgeCyanSoftBrush}" />
-                                        <TextBlock Text="Drop files on the radar, or choose them below."
+                                        <TextBlock Text="Drop files or folders on the radar, or choose them below."
                                                    Style="{StaticResource MutedTextStyle}"
                                                    FontSize="10.5"
+                                                   TextWrapping="Wrap"
                                                    VerticalAlignment="Center" />
                                     </StackPanel>
                                 </Border>
@@ -476,6 +483,15 @@
                                     <StackPanel Orientation="Horizontal" Spacing="7">
                                         <FontIcon Glyph="&#xE8E5;" FontFamily="Segoe MDL2 Assets" FontSize="12" />
                                         <TextBlock Text="Choose files" Style="{StaticResource BaseTextStyle}" FontSize="12" />
+                                    </StackPanel>
+                                </Button>
+
+                                <Button Style="{StaticResource SecondaryButtonStyle}"
+                                        Click="OnBrowseFolderClick"
+                                        HorizontalAlignment="Stretch">
+                                    <StackPanel Orientation="Horizontal" Spacing="7">
+                                        <FontIcon Glyph="&#xE8B7;" FontFamily="Segoe MDL2 Assets" FontSize="12" />
+                                        <TextBlock Text="Choose folder" Style="{StaticResource BaseTextStyle}" FontSize="12" />
                                     </StackPanel>
                                 </Button>
 
@@ -586,28 +602,61 @@
                                                                 <TextBlock Text="{Binding SizeText}"
                                                                            Style="{StaticResource MutedTextStyle}"
                                                                            FontSize="8.5" />
+                                                                <TextBlock Text="{Binding RemainingText}"
+                                                                           Style="{StaticResource MutedTextStyle}"
+                                                                           FontSize="8.5"
+                                                                           Visibility="{Binding RemainingText, Converter={StaticResource StringToVisibility}}" />
+                                                                <TextBlock Text="{Binding EtaText}"
+                                                                           Style="{StaticResource MutedTextStyle}"
+                                                                           FontSize="8.5"
+                                                                           Foreground="{StaticResource AirBridgeCyanSoftBrush}"
+                                                                           Visibility="{Binding EtaText, Converter={StaticResource StringToVisibility}}" />
                                                             </StackPanel>
+
+                                                            <ScrollViewer MaxHeight="108"
+                                                                          Margin="0,4,0,0"
+                                                                          VerticalScrollBarVisibility="Auto"
+                                                                          HorizontalScrollBarVisibility="Disabled"
+                                                                          Visibility="{Binding HasFileList, Converter={StaticResource BoolToVisibility}}">
+                                                                <ItemsControl ItemsSource="{Binding Files}">
+                                                                    <ItemsControl.ItemTemplate>
+                                                                        <DataTemplate>
+                                                                            <Grid ColumnSpacing="6" Margin="0,1">
+                                                                                <Grid.ColumnDefinitions>
+                                                                                    <ColumnDefinition Width="Auto" />
+                                                                                    <ColumnDefinition Width="*" />
+                                                                                    <ColumnDefinition Width="Auto" />
+                                                                                </Grid.ColumnDefinitions>
+
+                                                                                <FontIcon Glyph="{Binding Glyph}"
+                                                                                          FontFamily="Segoe MDL2 Assets"
+                                                                                          FontSize="9"
+                                                                                          Foreground="{StaticResource AirBridgeCyanSoftBrush}"
+                                                                                          VerticalAlignment="Center" />
+
+                                                                                <TextBlock Grid.Column="1"
+                                                                                           Text="{Binding Name}"
+                                                                                           Style="{StaticResource BaseTextStyle}"
+                                                                                           FontSize="9"
+                                                                                           MaxLines="1"
+                                                                                           TextTrimming="CharacterEllipsis"
+                                                                                           ToolTipService.ToolTip="{Binding RelativePath}" />
+
+                                                                                <TextBlock Grid.Column="2"
+                                                                                           Text="{Binding StatusText}"
+                                                                                           FontSize="8.5"
+                                                                                           MaxWidth="110"
+                                                                                           MaxLines="1"
+                                                                                           TextTrimming="CharacterEllipsis"
+                                                                                           Foreground="{Binding StatusColor, Converter={StaticResource HexBrush}}" />
+                                                                            </Grid>
+                                                                        </DataTemplate>
+                                                                    </ItemsControl.ItemTemplate>
+                                                                </ItemsControl>
+                                                            </ScrollViewer>
                                                         </StackPanel>
 
                                                         <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="1" VerticalAlignment="Center">
-                                                            <Button Style="{StaticResource IconButtonStyle}"
-                                                                    Width="28"
-                                                                    Height="28"
-                                                                    Click="OnPauseTransferClick"
-                                                                    ToolTipService.ToolTip="Pause transfer"
-                                                                    AutomationProperties.Name="Pause transfer"
-                                                                    Visibility="{Binding CanPause, Converter={StaticResource BoolToVisibility}}">
-                                                                <FontIcon Glyph="{Binding ActionGlyph}" FontFamily="Segoe MDL2 Assets" FontSize="11" />
-                                                            </Button>
-                                                            <Button Style="{StaticResource IconButtonStyle}"
-                                                                    Width="28"
-                                                                    Height="28"
-                                                                    Click="OnResumeTransferClick"
-                                                                    ToolTipService.ToolTip="Resume transfer"
-                                                                    AutomationProperties.Name="Resume transfer"
-                                                                    Visibility="{Binding CanResume, Converter={StaticResource BoolToVisibility}}">
-                                                                <FontIcon Glyph="{Binding ActionGlyph}" FontFamily="Segoe MDL2 Assets" FontSize="11" />
-                                                            </Button>
                                                             <Button Style="{StaticResource IconButtonStyle}"
                                                                     Width="28"
                                                                     Height="28"

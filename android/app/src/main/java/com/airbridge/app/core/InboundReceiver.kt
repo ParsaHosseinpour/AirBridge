@@ -3,13 +3,19 @@ package com.airbridge.app.core
 import android.content.Context
 import android.os.PowerManager
 import android.util.Log
+import com.airbridge.app.model.IncomingFilePhase
+import com.airbridge.app.model.IncomingFileUi
 import com.airbridge.app.model.IncomingPhase
 import com.airbridge.app.model.IncomingTransferUi
+import com.airbridge.core.BatchEvent
+import com.airbridge.core.BatchItemInfo
+import com.airbridge.core.BatchItemStatus
+import com.airbridge.core.BatchOptions
+import com.airbridge.core.BatchPhase
+import com.airbridge.core.BatchReport
+import com.airbridge.core.BatchSnapshot
+import com.airbridge.core.BatchTransferSession
 import com.airbridge.core.FfiException
-import com.airbridge.core.FileTransferSession
-import com.airbridge.core.ReceiveOptions
-import com.airbridge.core.TransferEvent
-import com.airbridge.core.TransferReport
 import com.airbridge.core.events
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -35,7 +41,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Long-lived inbound half of the transfer subsystem.
  *
  * The Rust discovery engine advertises `listenPort`, but it does not bind a
- * socket: binding is a property of a [FileTransferSession] created with
+ * socket: binding is a property of a [BatchTransferSession] created with
  * `receive`. This class keeps one such session bound to `0.0.0.0:42517`,
  * accepts exactly one peer at a time, and immediately re-arms after the
  * session ends. That is what turns the Windows sender's connection attempt
@@ -43,13 +49,15 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * # Consent and storage
  *
- * The FFI accept is a single step: the transport reads `HELLO`, starts
- * streaming, and writes into a destination path. There is no pre-accept
- * metadata callback and no raw-socket hand-off. To keep the user in control,
- * the payload is staged in the app's private cache and surfaced as an
- * [IncomingTransferUi] as soon as the transport reports `Started`. Bytes never
- * reach public Downloads until the user accepts; declining cancels the session
- * and deletes both the part file and its sidecar.
+ * The FFI accept is a single step: the transport reads the manifest, starts
+ * streaming, and writes every file into a per-offer staging directory. There
+ * is no pre-accept metadata callback and no raw-socket hand-off. To keep the
+ * user in control, the payload is staged in the app's private cache and
+ * surfaced as an [IncomingTransferUi] as soon as the transport reports the
+ * manifest. Bytes never reach public Downloads until the user accepts; a
+ * verified batch is then copied into `Downloads/AirBridge`, preserving the
+ * manifest's folder structure. Declining cancels the session and deletes the
+ * whole staging tree.
  *
  * # Threading
  *
@@ -77,13 +85,19 @@ class InboundReceiver(
     private var loopJob: Job? = null
 
     @Volatile
-    private var activeSession: FileTransferSession? = null
+    private var activeSession: BatchTransferSession? = null
 
     @Volatile
     private var currentOfferId: String? = null
 
     @Volatile
     private var currentStaging: File? = null
+
+    @Volatile
+    private var currentPeerId: String? = null
+
+    @Volatile
+    private var currentPeerFingerprint: String? = null
 
     /** Set when the user declined this offer, so a late completion cannot revive it. */
     @Volatile
@@ -137,21 +151,23 @@ class InboundReceiver(
         currentStaging?.let(::deleteStaging)
         currentStaging = null
         currentOfferId = null
+        currentPeerId = null
+        currentPeerFingerprint = null
         activeSession = null
     }
 
     /** User approved the current offer. */
     fun accept() {
-        var verificationSession: FileTransferSession? = null
+        var verificationSession: BatchTransferSession? = null
         synchronized(lock) {
             val current = _incoming.value ?: return
             when (current.phase) {
                 IncomingPhase.VERIFYING -> {
                     if (current.verificationSent) return
                     // The user has both confirmed the device and accepted the
-                    // file. Remember that before releasing the channel: the
-                    // `Started` event follows immediately and must not regress
-                    // this card back to the file-offer prompt.
+                    // files. Remember that before releasing the channel: the
+                    // manifest follows immediately and must not regress this
+                    // card back to the file-offer prompt.
                     accepted = true
                     _incoming.value = current.copy(
                         verificationSent = true,
@@ -198,7 +214,7 @@ class InboundReceiver(
 
     /** User declined the offer, or cancelled an accepted transfer. */
     fun decline() {
-        var session: FileTransferSession? = null
+        var session: BatchTransferSession? = null
         var announced = false
         synchronized(lock) {
             val current = _incoming.value ?: return
@@ -258,38 +274,35 @@ class InboundReceiver(
                 return
             }
 
-            val staging = File(stagingDirectory, "incoming-${UUID.randomUUID()}.bin")
+            val staging = File(stagingDirectory, "incoming-${UUID.randomUUID()}")
+            if (!staging.exists() && !staging.mkdirs()) {
+                Log.w(TAG, "Could not create the inbound staging directory")
+                delay(RETRY_SLOW_MS)
+                continue
+            }
+
             val offerId = UUID.randomUUID().toString()
             val announced = AtomicBoolean(false)
-            var session: FileTransferSession? = null
+            var session: BatchTransferSession? = null
             var slowRetry = false
 
             try {
                 session = withContext(Dispatchers.IO) {
-                    FileTransferSession.receive(
+                    BatchTransferSession.receive(
                         "0.0.0.0:$TRANSFER_PORT",
                         staging.absolutePath,
-                        ReceiveOptions(
-                            expectedPayloadId = null,
-                            ackEveryBytes = ACK_EVERY_BYTES.toULong(),
-                            verifyWholeFile = true,
-                            acceptTimeoutMs = ACCEPT_TIMEOUT_MS.toULong(),
-                            progressIntervalMs = PROGRESS_INTERVAL_MS.toULong(),
-                            identityPkcs8 = preferences.identityPkcs8,
-                            localPeerId = preferences.peerIdHex,
-                            trustedPeerFingerprints = preferences.trustedFingerprints().toList(),
-                        ),
+                        batchOptions(),
                     )
                 }
                 install(session, offerId, staging)
 
                 // Mark the session active before the pump starts, so an early
-                // `Started` cannot miss the wake lock or consent timeout.
+                // manifest cannot miss the wake lock or consent timeout.
                 sessionActive = true
                 val report = coroutineScope {
                     val collector = launch {
                         session.events().collect { event ->
-                            onTransferEvent(offerId, staging, announced, event)
+                            onBatchEvent(offerId, announced, event, session)
                         }
                     }
                     try {
@@ -303,11 +316,11 @@ class InboundReceiver(
 
                 lastListenerError = null
                 retryDelay = RETRY_FAST_MS
-                finishCompleted(offerId, staging, announced, report)
+                finishCompleted(offerId, staging, announced, report, session)
             } catch (c: CancellationException) {
                 throw c
             } catch (t: Throwable) {
-                slowRetry = finishFailed(offerId, staging, announced, t)
+                slowRetry = finishFailed(offerId, staging, announced, session, t)
                 retryDelay = if (slowRetry) RETRY_SLOW_MS else RETRY_FAST_MS
             } finally {
                 releaseWakeLock()
@@ -321,8 +334,21 @@ class InboundReceiver(
         }
     }
 
+    private fun batchOptions(): BatchOptions {
+        return BatchOptions(
+            identityPkcs8 = preferences.identityPkcs8,
+            trustedPeerFingerprints = preferences.trustedFingerprints().toList(),
+            ackEveryBytes = ACK_EVERY_BYTES.toULong(),
+            verifyWholeFile = true,
+            responseTimeoutMs = RESPONSE_TIMEOUT_MS.toULong(),
+            acceptTimeoutMs = ACCEPT_TIMEOUT_MS.toULong(),
+            progressIntervalMs = PROGRESS_INTERVAL_MS.toULong(),
+            localPeerId = preferences.peerIdHex,
+        )
+    }
+
     private fun install(
-        session: FileTransferSession,
+        session: BatchTransferSession,
         offerId: String,
         staging: File,
     ) {
@@ -330,6 +356,8 @@ class InboundReceiver(
             activeSession = session
             currentOfferId = offerId
             currentStaging = staging
+            currentPeerId = null
+            currentPeerFingerprint = null
             accepted = false
             sessionActive = false
             declinedOfferId = null
@@ -344,6 +372,8 @@ class InboundReceiver(
             activeSession = null
             currentOfferId = null
             currentStaging = null
+            currentPeerId = null
+            currentPeerFingerprint = null
             accepted = false
             sessionActive = false
             pendingDecision = null
@@ -352,20 +382,21 @@ class InboundReceiver(
         }
     }
 
-    private fun onTransferEvent(
+    private fun onBatchEvent(
         offerId: String,
-        staging: File,
         announced: AtomicBoolean,
-        event: TransferEvent,
+        event: BatchEvent,
+        session: BatchTransferSession,
     ) {
         when (event) {
-            is TransferEvent.VerificationRequired -> {
+            is BatchEvent.VerificationRequired -> {
                 val shown = synchronized(lock) {
                     if (currentOfferId != offerId || declinedOfferId == offerId) {
                         false
                     } else {
                         val current = _incoming.value?.takeIf { it.id == offerId }
-                        _incoming.value = (current ?: IncomingTransferUi(id = offerId)).copy(
+                            ?: IncomingTransferUi(id = offerId)
+                        _incoming.value = current.copy(
                             phase = IncomingPhase.VERIFYING,
                             sas = event.sas,
                             peerFingerprint = event.peerFingerprint,
@@ -377,64 +408,128 @@ class InboundReceiver(
                 }
                 if (shown && sessionActive) acquireWakeLock()
             }
-            is TransferEvent.PeerVerified -> {
-                val accepted = synchronized(lock) {
+            is BatchEvent.PeerVerified -> {
+                val active = synchronized(lock) {
                     if (currentOfferId != offerId || declinedOfferId == offerId) {
                         false
                     } else {
+                        currentPeerId = event.peerId
+                        currentPeerFingerprint = event.peerFingerprint
                         val current = _incoming.value?.takeIf { it.id == offerId }
-                        if (current == null) {
-                            false
-                        } else {
+                        if (current != null) {
                             _incoming.value = current.copy(
                                 peerIdHex = event.peerId,
                                 peerFingerprint = event.peerFingerprint,
                             )
-                            true
                         }
+                        true
                     }
                 }
-                if (accepted) onPeerVerified(event.peerId, event.peerFingerprint)
+                if (active) onPeerVerified(event.peerId, event.peerFingerprint)
             }
-            is TransferEvent.Started -> {
-                ensureOffer(offerId, staging, announced, event.totalBytes?.toLong())
+            is BatchEvent.Started -> {
+                val snapshot = session.snapshot()
+                ensureOffer(offerId, announced, snapshot, event.totalBytes.toLong())
             }
-            is TransferEvent.Progress -> {
-                ensureOffer(offerId, staging, announced, event.totalBytes?.toLong())
-                val needsTotal = _incoming.value
-                    ?.let { it.id == offerId && it.totalBytes == null } == true
-                val hint = event.totalBytes?.toLong()
-                    ?: if (needsTotal) InboundResumeHints.totalBytes(staging) else null
-                val moved = event.bytesTransferred.toLong()
+            is BatchEvent.FileStarted -> {
+                updateRow(offerId, event.index.toInt()) { row ->
+                    row.copy(
+                        size = event.size.toLong().takeIf { it > 0L } ?: row.size,
+                        bytesTransferred = 0L,
+                        phase = IncomingFilePhase.ACTIVE,
+                        error = null,
+                    )
+                }
+            }
+            is BatchEvent.Progress -> {
+                if (!announced.get()) {
+                    ensureOffer(offerId, announced, session.snapshot(), event.totalBytes.toLong())
+                }
+                val activeIndex = event.currentFileIndex?.toInt()
                 _incoming.update { current ->
                     if (current?.id != offerId || current.phase.isTerminal) {
                         current
                     } else {
                         current.copy(
-                            bytesTransferred = maxOf(current.bytesTransferred, moved),
-                            totalBytes = current.totalBytes ?: hint,
+                            bytesTransferred = maxOf(
+                                current.bytesTransferred,
+                                event.bytesTransferred.toLong(),
+                            ),
+                            totalBytes = event.totalBytes.toLong().takeIf { it > 0L }
+                                ?: current.totalBytes,
+                            etaMillis = event.estimatedRemainingMs?.toLong(),
                             phase = if (accepted && current.phase == IncomingPhase.WAITING) {
                                 IncomingPhase.RECEIVING
                             } else {
                                 current.phase
                             },
+                            files = if (activeIndex == null) {
+                                current.files
+                            } else {
+                                current.files.map { row ->
+                                    if (row.index == activeIndex) {
+                                        row.copy(
+                                            size = event.fileSize.toLong().takeIf { it > 0L }
+                                                ?: row.size,
+                                            bytesTransferred =
+                                                event.fileBytesTransferred.toLong(),
+                                            phase = IncomingFilePhase.ACTIVE,
+                                        )
+                                    } else {
+                                        row
+                                    }
+                                }
+                            },
                         )
                     }
                 }
             }
-            // Terminal events are applied from the authoritative `run` result.
-            is TransferEvent.Completed, is TransferEvent.Failed,
-            TransferEvent.Cancelled, is TransferEvent.Lagged -> Unit
+            is BatchEvent.FileCompleted -> {
+                updateRow(offerId, event.index.toInt()) { row ->
+                    row.copy(
+                        size = event.size.toLong().takeIf { it > 0L } ?: row.size,
+                        bytesTransferred = event.size.toLong(),
+                        phase = IncomingFilePhase.COMPLETED,
+                        error = null,
+                    )
+                }
+            }
+            is BatchEvent.FileFailed -> {
+                updateRow(offerId, event.index.toInt()) { row ->
+                    row.copy(
+                        phase = IncomingFilePhase.FAILED,
+                        error = event.message.ifBlank { event.kind },
+                    )
+                }
+            }
+            // The authoritative result comes from `run`; see finishCompleted.
+            is BatchEvent.Finished -> Unit
+            is BatchEvent.Failed -> {
+                if (declinedOfferId != offerId) {
+                    markFailed(friendlyError(event))
+                }
+            }
+            BatchEvent.Cancelled -> Unit
+            is BatchEvent.Lagged -> {
+                val snapshot = session.snapshot()
+                if (!announced.get() && snapshot.totalFiles > 0u) {
+                    ensureOffer(offerId, announced, snapshot, snapshot.totalBytes.toLong())
+                }
+                applySnapshot(offerId, snapshot)
+            }
         }
     }
 
+    /** Builds the offer card from the manifest snapshot. */
     private fun ensureOffer(
         offerId: String,
-        staging: File,
         announced: AtomicBoolean,
+        snapshot: BatchSnapshot,
         reportedTotal: Long?,
     ) {
-        val total = reportedTotal ?: InboundResumeHints.totalBytes(staging)
+        val total = reportedTotal
+            ?.takeIf { it > 0L }
+            ?: snapshot.totalBytes.toLong().takeIf { it > 0L }
         if (announced.compareAndSet(false, true)) {
             var waiting = false
             synchronized(lock) {
@@ -451,11 +546,21 @@ class InboundReceiver(
                     return
                 }
                 waiting = !accepted
+                val rows = snapshot.items.map(::rowFromItem)
                 val base = _incoming.value?.takeIf { it.id == offerId }
-                _incoming.value = (base ?: IncomingTransferUi(id = offerId)).copy(
+                    ?: IncomingTransferUi(id = offerId)
+                _incoming.value = base.copy(
+                    fileName = batchTitle(rows),
+                    files = rows.ifEmpty { base.files },
                     totalBytes = total,
+                    bytesTransferred = maxOf(
+                        base.bytesTransferred,
+                        snapshot.transferredBytes.toLong(),
+                    ),
+                    batchId = snapshot.batchId.takeIf { it != 0UL } ?: base.batchId,
                     phase = if (accepted) IncomingPhase.RECEIVING else IncomingPhase.WAITING,
                     verificationSent = false,
+                    error = null,
                 )
             }
             if (!sessionActive) return
@@ -476,6 +581,73 @@ class InboundReceiver(
         }
     }
 
+    private fun applySnapshot(offerId: String, snapshot: BatchSnapshot) {
+        _incoming.update { current ->
+            if (current?.id != offerId || current.phase.isTerminal) {
+                current
+            } else {
+                val previous = current.files.associateBy { it.index }
+                current.copy(
+                    files = snapshot.items.map { item ->
+                        val merged = rowFromItem(item)
+                        val old = previous[merged.index]
+                        if (old?.savedUri != null) {
+                            merged.copy(
+                                savedName = old.savedName,
+                                savedUri = old.savedUri,
+                            )
+                        } else {
+                            merged
+                        }
+                    },
+                    totalBytes = snapshot.totalBytes.toLong().takeIf { it > 0L }
+                        ?: current.totalBytes,
+                    bytesTransferred = maxOf(
+                        current.bytesTransferred,
+                        snapshot.transferredBytes.toLong(),
+                    ),
+                    etaMillis = snapshot.estimatedRemainingMs?.toLong(),
+                    batchId = snapshot.batchId.takeIf { it != 0UL } ?: current.batchId,
+                )
+            }
+        }
+    }
+
+    private fun updateRow(
+        offerId: String,
+        index: Int,
+        transform: (IncomingFileUi) -> IncomingFileUi,
+    ) {
+        _incoming.update { current ->
+            if (current?.id != offerId || current.phase.isTerminal) {
+                current
+            } else {
+                current.copy(
+                    files = current.files.map { row ->
+                        if (row.index == index) transform(row) else row
+                    },
+                )
+            }
+        }
+    }
+
+    private fun rowFromItem(item: BatchItemInfo): IncomingFileUi = IncomingFileUi(
+        index = item.index.toInt(),
+        relativePath = item.relativePath,
+        size = item.size.toLong(),
+        bytesTransferred = item.bytesTransferred.toLong(),
+        phase = item.status.toFilePhase(),
+        error = item.error,
+    )
+
+    private fun BatchItemStatus.toFilePhase(): IncomingFilePhase = when (this) {
+        BatchItemStatus.PENDING -> IncomingFilePhase.PENDING
+        BatchItemStatus.ACTIVE -> IncomingFilePhase.ACTIVE
+        BatchItemStatus.COMPLETED -> IncomingFilePhase.COMPLETED
+        BatchItemStatus.FAILED -> IncomingFilePhase.FAILED
+        BatchItemStatus.CANCELLED -> IncomingFilePhase.CANCELLED
+    }
+
     private fun scheduleConsentTimeout(offerId: String) {
         if (!running.get()) return
         consentJob?.cancel()
@@ -486,7 +658,7 @@ class InboundReceiver(
     }
 
     private fun declineIfWaiting(offerId: String) {
-        var session: FileTransferSession? = null
+        var session: BatchTransferSession? = null
         var expired = false
         synchronized(lock) {
             val current = _incoming.value
@@ -509,25 +681,63 @@ class InboundReceiver(
         offerId: String,
         staging: File,
         announced: AtomicBoolean,
-        report: TransferReport,
+        report: BatchReport,
+        session: BatchTransferSession,
     ) {
         announced.set(true)
         consentJob?.cancel()
         consentJob = null
         lastListenerError = null
 
-        if (report.pairingOnly) {
-            finishPairingOnly(offerId, report)
+        if (report.totalFiles == 0u && report.files.isEmpty()) {
+            finishPairingOnly(offerId, report, session)
             return
         }
 
-        val total = report.totalBytes.toLong().coerceAtLeast(0L)
-        val extension = withContext(Dispatchers.IO) { IncomingFileKinds.sniffExtension(staging) }
-        val name = IncomingNames.friendly(report.payloadId, extension = extension)
+        if (declinedOfferId == offerId) {
+            synchronized(lock) {
+                if (_incoming.value?.id == offerId) _incoming.value = null
+            }
+            return
+        }
+
+        val rows = mergeReportRows(offerId, report)
+        val completed = report.completedFiles.toInt()
+
+        if (report.status == BatchPhase.CANCELLED) {
+            synchronized(lock) {
+                if (_incoming.value?.id == offerId) _incoming.value = null
+            }
+            return
+        }
+
+        if (completed == 0) {
+            val message = rows.firstNotNullOfOrNull { row ->
+                row.error?.takeIf { row.phase == IncomingFilePhase.FAILED }
+            } ?: "No files could be received"
+            synchronized(lock) {
+                val current = _incoming.value?.takeIf { it.id == offerId }
+                    ?: IncomingTransferUi(id = offerId)
+                _incoming.value = current.copy(
+                    fileName = batchTitle(rows),
+                    files = rows,
+                    phase = IncomingPhase.FAILED,
+                    totalBytes = report.totalBytes.toLong().takeIf { it > 0L },
+                    bytesTransferred = report.transferredBytes.toLong(),
+                    etaMillis = null,
+                    batchId = report.batchId,
+                    sas = null,
+                    error = message,
+                )
+            }
+            notify("Incoming transfer failed")
+            scheduleAutoDismiss(offerId)
+            return
+        }
 
         // Display READY and install the decision handle under one lock, so a
         // Discard tap cannot land between "card shown" and "decision awaited"
-        // and leave the listener blocked forever.
+        // and leave the receiver blocked forever.
         var approvedNow = false
         var decision: CompletableDeferred<Boolean>? = null
         synchronized(lock) {
@@ -538,25 +748,24 @@ class InboundReceiver(
             }
             val current = _incoming.value?.takeIf { it.id == offerId }
                 ?: IncomingTransferUi(id = offerId)
+            val updated = current.copy(
+                fileName = batchTitle(rows),
+                files = rows,
+                bytesTransferred = report.transferredBytes.toLong(),
+                totalBytes = report.totalBytes.toLong().takeIf { it > 0L }
+                    ?: current.totalBytes,
+                batchId = report.batchId,
+                etaMillis = null,
+                sas = null,
+                error = null,
+            )
             if (accepted) {
-                _incoming.value = current.copy(
-                    fileName = name,
-                    bytesTransferred = total,
-                    totalBytes = total.takeIf { it > 0L } ?: current.totalBytes,
-                    phase = IncomingPhase.SAVING,
-                    error = null,
-                )
+                _incoming.value = updated.copy(phase = IncomingPhase.SAVING)
                 approvedNow = true
             } else {
                 decision = CompletableDeferred()
                 pendingDecision = decision
-                _incoming.value = current.copy(
-                    fileName = name,
-                    bytesTransferred = total,
-                    totalBytes = total.takeIf { it > 0L } ?: current.totalBytes,
-                    phase = IncomingPhase.READY,
-                    error = null,
-                )
+                _incoming.value = updated.copy(phase = IncomingPhase.READY)
             }
         }
         if (!approvedNow) {
@@ -573,43 +782,149 @@ class InboundReceiver(
             }
         }
 
-        // Copy into Downloads, allowing a retry after a transient failure such
-        // as the legacy storage prompt being declined once.
+        saveBatch(offerId, staging, report)
+    }
+
+    /**
+     * Completes a pairing-only connection: the peer was authenticated, but
+     * there is no file to offer or save. Pairing and transfers share the
+     * listener port, so this is a normal, non-error outcome.
+     */
+    private fun finishPairingOnly(
+        offerId: String,
+        report: BatchReport,
+        session: BatchTransferSession,
+    ) {
+        val peerId = session.peerId() ?: currentPeerId
+        val fingerprint = session.peerFingerprint() ?: currentPeerFingerprint
+        if (peerId != null && fingerprint != null) {
+            onPeerVerified(peerId, fingerprint)
+        }
+        synchronized(lock) {
+            if (currentOfferId != offerId) return
+            if (declinedOfferId == offerId) {
+                _incoming.value = null
+                return
+            }
+            val current = _incoming.value?.takeIf { it.id == offerId }
+                ?: IncomingTransferUi(id = offerId)
+            _incoming.value = current.copy(
+                fileName = "Device verification",
+                phase = IncomingPhase.VERIFIED,
+                pairingOnly = true,
+                files = emptyList(),
+                peerIdHex = peerId ?: current.peerIdHex,
+                peerFingerprint = fingerprint ?: current.peerFingerprint,
+                bytesTransferred = 0,
+                totalBytes = null,
+                batchId = null,
+                etaMillis = null,
+                error = null,
+                verificationSent = false,
+            )
+        }
+        notify("Device verified")
+        scheduleAutoDismiss(offerId)
+    }
+
+    /**
+     * Copies every verified file from staging into public Downloads.
+     *
+     * The first pass runs without another prompt when the user accepted the
+     * incoming offer. A save failure (for example the API 26-28 storage grant)
+     * returns the card to READY with an error and waits for a retry, preserving
+     * files that were already committed.
+     */
+    private suspend fun saveBatch(
+        offerId: String,
+        staging: File,
+        report: BatchReport,
+    ) {
+        val completedIndexes = report.files
+            .filter { it.status == BatchItemStatus.COMPLETED }
+            .map { it.index }
+            .toSet()
+
         while (true) {
             setPhase(offerId, IncomingPhase.SAVING, error = null)
-            val save = withContext(Dispatchers.IO) {
-                runCatching { store.save(staging, name) }
+            val savedIndexes = _incoming.value
+                ?.takeIf { it.id == offerId }
+                ?.files
+                ?.filter { it.savedUri != null }
+                ?.map { it.index.toUInt() }
+                ?.toSet()
+                ?: emptySet()
+            val remaining = report.files.filter { item ->
+                item.index in completedIndexes && item.index !in savedIndexes
             }
-            val saved = save.getOrNull()
-            if (saved != null) {
-                synchronized(lock) {
-                    val current = _incoming.value
-                    if (current?.id == offerId) {
-                        _incoming.value = current.copy(
-                            fileName = saved.name,
-                            bytesTransferred = total,
-                            totalBytes = total.takeIf { it > 0L } ?: current.totalBytes,
-                            phase = IncomingPhase.SAVED,
-                            error = null,
-                            savedName = saved.name,
-                            savedUri = saved.uri,
-                        )
-                    }
-                }
-                notify("Saved ${saved.name} to Downloads")
-                scheduleAutoDismiss(offerId)
+
+            if (remaining.isEmpty()) {
+                finishSaved(offerId, report)
                 return
             }
 
-            val error = friendlyError(save.exceptionOrNull())
+            var lastFailure: Throwable? = null
+            for (item in remaining) {
+                val source = resolveStagedSource(staging, item)
+                updateRow(offerId, item.index.toInt()) { row ->
+                    row.copy(phase = IncomingFilePhase.ACTIVE, error = null)
+                }
+                val save = withContext(Dispatchers.IO) {
+                    runCatching {
+                        store.save(
+                            source = source,
+                            displayName = item.relativePath.substringAfterLast('/'),
+                            relativePath = item.relativePath,
+                        )
+                    }
+                }
+                val saved = save.getOrNull()
+                if (saved != null) {
+                    updateRow(offerId, item.index.toInt()) { row ->
+                        row.copy(
+                            phase = IncomingFilePhase.COMPLETED,
+                            bytesTransferred = item.size.toLong(),
+                            savedName = saved.name,
+                            savedUri = saved.uri,
+                            error = null,
+                        )
+                    }
+                    continue
+                }
+
+                val failure = save.exceptionOrNull()
+                lastFailure = failure
+                updateRow(offerId, item.index.toInt()) { row ->
+                    row.copy(
+                        phase = IncomingFilePhase.FAILED,
+                        error = friendlyError(failure),
+                    )
+                }
+                // A missing storage grant fails every subsequent write too.
+                if (failure is StoragePermissionRequiredException) break
+            }
+
+            val current = _incoming.value?.takeIf { it.id == offerId }
+            val savedRows = current?.files?.filter { it.savedUri != null }.orEmpty()
+            if (savedRows.size >= completedIndexes.size) {
+                finishSaved(offerId, report)
+                return
+            }
+
             var retryDecision: CompletableDeferred<Boolean>? = null
             synchronized(lock) {
                 accepted = false
-                val current = _incoming.value
-                if (current?.id == offerId) {
-                    _incoming.value = current.copy(
+                val visible = _incoming.value?.takeIf { it.id == offerId }
+                if (visible != null) {
+                    _incoming.value = visible.copy(
                         phase = IncomingPhase.READY,
-                        error = error,
+                        etaMillis = null,
+                        error = lastFailure?.let(::friendlyError)
+                            ?: if (savedRows.isEmpty()) {
+                                "The received files could not be saved"
+                            } else {
+                                "Saved ${savedRows.size} of ${completedIndexes.size} files"
+                            },
                     )
                 }
                 retryDecision = CompletableDeferred()
@@ -629,37 +944,87 @@ class InboundReceiver(
         }
     }
 
-    /**
-     * Completes a pairing-only connection: the peer was authenticated, but
-     * there is no file to offer or save.
-     */
-    private fun finishPairingOnly(offerId: String, report: TransferReport) {
-        val peerId = report.peerId
-        val fingerprint = report.peerFingerprint
-        if (peerId != null && fingerprint != null) {
-            onPeerVerified(peerId, fingerprint)
-        }
+    private fun finishSaved(offerId: String, report: BatchReport) {
+        var savedCount = 0
+        var savedName: String? = null
+        var savedUri: String? = null
         synchronized(lock) {
-            if (currentOfferId != offerId) return
-            if (declinedOfferId == offerId) {
-                _incoming.value = null
-                return
+            val current = _incoming.value?.takeIf { it.id == offerId } ?: return
+            val saved = current.files.filter { it.savedUri != null }
+            savedCount = saved.size
+            savedName = if (saved.size == 1) {
+                saved.first().savedName ?: saved.first().name
+            } else {
+                "$savedCount files"
             }
-            val current = _incoming.value?.takeIf { it.id == offerId }
-                ?: IncomingTransferUi(id = offerId)
+            savedUri = saved.firstOrNull()?.savedUri
             _incoming.value = current.copy(
-                phase = IncomingPhase.VERIFIED,
-                pairingOnly = true,
-                peerIdHex = peerId ?: current.peerIdHex,
-                peerFingerprint = fingerprint ?: current.peerFingerprint,
-                bytesTransferred = 0,
-                totalBytes = null,
+                phase = IncomingPhase.SAVED,
+                fileName = savedName ?: current.fileName,
+                savedName = savedName,
+                savedUri = savedUri,
+                files = current.files.map { row ->
+                    if (row.phase == IncomingFilePhase.ACTIVE) {
+                        row.copy(phase = IncomingFilePhase.CANCELLED)
+                    } else {
+                        row
+                    }
+                },
+                bytesTransferred = report.transferredBytes.toLong()
+                    .takeIf { it > 0L } ?: current.bytesTransferred,
+                etaMillis = null,
                 error = null,
-                verificationSent = false,
             )
         }
-        notify("Device verified")
+        notify(
+            if (savedCount == 1) {
+                "Saved ${savedName ?: "file"} to Downloads"
+            } else {
+                "Saved $savedCount files to Downloads"
+            },
+        )
         scheduleAutoDismiss(offerId)
+    }
+
+    private fun mergeReportRows(offerId: String, report: BatchReport): List<IncomingFileUi> {
+        val current = _incoming.value?.takeIf { it.id == offerId }
+        val previous = current?.files?.associateBy { it.index }.orEmpty()
+        return report.files.map { item ->
+            val mapped = rowFromItem(item)
+            val old = previous[mapped.index]
+            if (old?.savedUri != null) {
+                mapped.copy(savedName = old.savedName, savedUri = old.savedUri)
+            } else {
+                mapped
+            }
+        }
+    }
+
+    private fun resolveStagedSource(staging: File, item: BatchItemInfo): File {
+        val reported = item.destinationPath
+            ?.takeIf { it.isNotBlank() }
+            ?.let(::File)
+        if (reported != null && reported.isFile && isInside(staging, reported)) {
+            return reported
+        }
+
+        var candidate = staging
+        item.relativePath.replace('\\', '/').split('/').forEach { segment ->
+            if (segment.isBlank() || segment == "." || segment == ".." || segment.contains(':')) {
+                throw IOException("The sender used an unsafe file path")
+            }
+            candidate = File(candidate, segment)
+        }
+        if (!candidate.isFile) {
+            throw IOException("The received file is no longer available")
+        }
+        return candidate
+    }
+
+    private fun isInside(root: File, candidate: File): Boolean {
+        val rootPath = runCatching { root.canonicalPath }.getOrNull() ?: return false
+        val candidatePath = runCatching { candidate.canonicalPath }.getOrNull() ?: return false
+        return candidatePath == rootPath || candidatePath.startsWith(rootPath + File.separator)
     }
 
     /**
@@ -672,6 +1037,7 @@ class InboundReceiver(
         offerId: String,
         staging: File,
         announced: AtomicBoolean,
+        session: BatchTransferSession?,
         error: Throwable,
     ): Boolean {
         consentJob?.cancel()
@@ -679,7 +1045,11 @@ class InboundReceiver(
 
         val cancelled = error is FfiException.Cancelled
         val current = _incoming.value
-        val hadOffer = announced.get() || current?.id == offerId
+        // The event pump can lag behind `run`, so consult the session state
+        // before treating an authenticated peer's failure as port-scan noise.
+        val authenticated = runCatching { session?.peerFingerprint() != null }
+            .getOrDefault(false)
+        val hadOffer = announced.get() || current?.id == offerId || authenticated
 
         if (declinedOfferId == offerId) {
             synchronized(lock) {
@@ -714,19 +1084,35 @@ class InboundReceiver(
             return false
         }
 
-        synchronized(lock) {
-            val active = _incoming.value
-            if (active?.id == offerId) {
-                _incoming.value = active.copy(
+        markFailed(friendlyError(error))
+        notify("Incoming transfer failed")
+        scheduleAutoDismiss(offerId)
+        return false
+    }
+
+    private fun markFailed(message: String) {
+        _incoming.update { current ->
+            if (current == null || current.phase.isTerminal) {
+                current
+            } else {
+                current.copy(
                     phase = IncomingPhase.FAILED,
-                    error = friendlyError(error),
+                    error = message,
+                    etaMillis = null,
+                    sas = null,
+                    files = current.files.map { row ->
+                        if (row.phase.isTerminal) {
+                            row
+                        } else {
+                            row.copy(
+                                phase = IncomingFilePhase.FAILED,
+                                error = row.error ?: message,
+                            )
+                        }
+                    },
                 )
             }
         }
-        notify("Incoming transfer failed")
-        scheduleAutoDismiss(offerId)
-        deleteStaging(staging)
-        return false
     }
 
     private fun setPhase(offerId: String, phase: IncomingPhase, error: String?) {
@@ -782,14 +1168,18 @@ class InboundReceiver(
 
     private fun cleanupStaging() {
         runCatching {
-            stagingDirectory.listFiles()?.forEach { file -> file.delete() }
+            stagingDirectory.listFiles()?.forEach { file -> file.deleteRecursively() }
         }
     }
 
     private fun deleteStaging(staging: File) {
-        runCatching { staging.delete() }
-        runCatching { File(staging.absolutePath + ".part").delete() }
-        runCatching { File(staging.absolutePath + ".part.state").delete() }
+        runCatching { staging.deleteRecursively() }
+    }
+
+    private fun batchTitle(rows: List<IncomingFileUi>): String = when {
+        rows.isEmpty() -> "Incoming files"
+        rows.size == 1 -> rows.first().name
+        else -> "${rows.size} files"
     }
 
     private fun friendlyError(error: Throwable?): String = when (error) {
@@ -807,10 +1197,14 @@ class InboundReceiver(
         is FfiException.AlreadyFinished -> "This verification is no longer available"
         is FfiException.Io -> error.message.ifBlank { "A network error interrupted the transfer" }
         is FfiException.Protocol -> "The other device sent invalid data"
+        is FfiException.InvalidArgument -> error.message.ifBlank { "The transfer could not start" }
         is UnsatisfiedLinkError -> "The native core is missing for this device's ABI"
         is IOException -> error.message ?: "A file error interrupted the transfer"
         else -> error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
     }
+
+    private fun friendlyError(event: BatchEvent.Failed): String =
+        event.message.ifBlank { event.kind.ifBlank { "The transfer failed" } }
 
     companion object {
         private const val TAG = "InboundReceiver"
@@ -822,6 +1216,7 @@ class InboundReceiver(
         private const val ACCEPT_TIMEOUT_MS = 120_000L
         private const val ACK_EVERY_BYTES = 4L * 1024L * 1024L
         private const val PROGRESS_INTERVAL_MS = 100L
+        private const val RESPONSE_TIMEOUT_MS = 90_000L
         private const val CONSENT_TIMEOUT_MS = 120_000L
         private const val RETRY_FAST_MS = 500L
         private const val RETRY_SLOW_MS = 5_000L

@@ -425,7 +425,7 @@ private fun CentralNode(
             )
             Spacer(Modifier.height(2.dp))
             Text(
-                text = transfer.fileName,
+                text = transfer.activeFile?.name ?: transfer.fileName,
                 color = TextMuted,
                 fontSize = 10.sp,
                 maxLines = 1,
@@ -433,6 +433,25 @@ private fun CentralNode(
                 modifier = Modifier.width(210.dp),
                 textAlign = TextAlign.Center,
             )
+            val progressLine = when {
+                transfer.isBatch -> buildString {
+                    append("${transfer.completedFiles} of ${transfer.files.size} files")
+                    transfer.etaText?.let { append(" · $it") }
+                }
+                else -> transfer.etaText
+            }
+            if (progressLine != null) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = progressLine,
+                    color = TextMuted.copy(alpha = 0.85f),
+                    fontSize = 9.5.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.width(210.dp),
+                    textAlign = TextAlign.Center,
+                )
+            }
             Spacer(Modifier.height(2.dp))
             if (transfer.phase.isActive) {
                 TextButton(
@@ -538,6 +557,7 @@ private fun transferColor(transfer: TransferUi): Color = when (transfer.phase) {
 }
 
 private fun transferStatus(transfer: TransferUi): String = when (transfer.phase) {
+    TransferPhase.PREPARING -> if (transfer.isBatch) "Preparing files…" else "Preparing…"
     TransferPhase.CONNECTING -> "Connecting…"
     TransferPhase.VERIFYING -> {
         val code = transfer.sas
@@ -548,8 +568,16 @@ private fun transferStatus(transfer: TransferUi): String = when (transfer.phase)
         if (percent != null) "${transfer.verb} $percent%" else "${transfer.verb}…"
     }
     TransferPhase.CANCELLING -> "Stopping…"
-    TransferPhase.COMPLETED -> transfer.completedVerb
-    TransferPhase.FAILED -> "Couldn't send"
+    TransferPhase.COMPLETED -> if (transfer.isBatch) {
+        "${transfer.completedVerb} ${transfer.files.size} files"
+    } else {
+        transfer.completedVerb
+    }
+    TransferPhase.FAILED -> if (transfer.failedFiles > 0) {
+        "Couldn't send ${transfer.failedFiles} of ${transfer.files.size}"
+    } else {
+        "Couldn't send"
+    }
     TransferPhase.CANCELLED -> "Cancelled"
 }
 

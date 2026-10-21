@@ -194,6 +194,7 @@ class AirBridgeService : Service() {
     }
 
     private fun transferText(transfer: TransferUi): String = when (transfer.phase) {
+        TransferPhase.PREPARING -> getString(R.string.notification_preparing)
         TransferPhase.CONNECTING -> getString(R.string.notification_connecting, transfer.peerName)
         TransferPhase.VERIFYING ->
             getString(R.string.notification_verify_transfer, transfer.peerName)

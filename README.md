@@ -72,15 +72,16 @@ independent of any UI toolkit, executor, or operating system.
 | `bindings/kotlin` | Kotlin | Cold `Flow` adapters over the generated bindings |
 | `bindings/csharp` | C# / .NET 8 | Event pumps and the `AirBridge.Core` wrapper assembly |
 | `android/` | Kotlin, Compose, AGP 9 | Foreground service, BLE backend, MediaStore receive path, radar UI |
-| `windows/` | C# / .NET 8, WinUI 3 | WinRT BLE backend, serial transfer queue, firewall setup, radar UI |
+| `windows/` | C# / .NET 8, WinUI 3 | WinRT BLE backend, serial batch transfer queue, firewall setup, radar UI |
 
 A typical transfer flows through the stack like this:
 
 1. The platform BLE backend and the Rust mDNS/subnet tiers produce sightings.
 2. `PeerDiscoveryEngine` deduplicates them into `PeerInfo` values keyed by a
    16-byte peer id and emits discovery events.
-3. The app opens a `FileTransferSession` for one file, or a
-   `BatchTransferSession` for a prepared multi-file manifest.
+3. The app prepares a `BatchTransferSession`, adding every selected file (with
+   its relative path) before running it. Even a single file travels as a
+   one-entry batch, so folders and multi-file sends share one manifest.
 4. `libcore_transport` splits each file into checksummed chunks, resumes from
    the receiver's verified offset, and commits only after the whole-file digest
    matches. `libcore_transfer` orders the manifest entries and tracks the queue.

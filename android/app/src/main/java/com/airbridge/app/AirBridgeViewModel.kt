@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.IBinder
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
@@ -43,6 +44,13 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+/** Result of walking a document tree before it is merged into the send list. */
+private data class FolderSelection(
+    val files: List<SelectedFile>,
+    val capped: Boolean,
+    val error: Throwable?,
+)
 
 /** A pairing sheet that is waiting for the user to compare codes. */
 data class PairingUi(
@@ -209,30 +217,185 @@ class AirBridgeViewModel(application: Application) : AndroidViewModel(applicatio
                         )
                     }
                 }
-                uris.mapNotNull(::describeDocument)
+                uris.mapNotNull { uri -> describeDocument(uri) }
             }
-            if (described.isEmpty()) {
-                message("Couldn't read the selected files")
-                return@launch
-            }
-            val current = _selectedFiles.value
-            val keys = current.mapTo(mutableSetOf()) { it.key }
-            val merged = current.toMutableList()
-            var added = 0
-            described.forEach { file ->
-                if (keys.add(file.key)) {
-                    merged += file
-                    added++
-                }
-            }
-            if (added == 0) {
-                message("Already in the list")
-                return@launch
-            }
-            _selectedFiles.value = merged
-            message("${formatCount(added)} ready to send")
+            mergeSelected(described)
         }
     }
+
+    /**
+     * Adds every file below a user-picked document tree.
+     *
+     * The tree URI is the only persistable grant needed: child document URIs
+     * keep the tree's read permission while it is held. Folder structure is
+     * preserved in [SelectedFile.relativePath] so the batch manifest recreates
+     * it on the receiver.
+     */
+    fun addFolder(treeUri: Uri) {
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    app.contentResolver.takePersistableUriPermission(
+                        treeUri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                    )
+                }
+                val rootId = runCatching {
+                    DocumentsContract.getTreeDocumentId(treeUri)
+                }.getOrNull()
+                    ?: return@withContext FolderSelection(emptyList(), false, null)
+                val rootName = treeDisplayName(treeUri, rootId) ?: "Folder"
+                val collected = ArrayList<SelectedFile>()
+                val visited = HashSet<String>()
+                runCatching {
+                    collectFolder(
+                        treeUri = treeUri,
+                        documentId = rootId,
+                        relativeRoot = sanitizeSegment(rootName),
+                        output = collected,
+                        visited = visited,
+                        depth = 0,
+                    )
+                }.exceptionOrNull()?.let { error ->
+                    return@withContext FolderSelection(collected, false, error)
+                }
+                FolderSelection(
+                    files = collected,
+                    capped = collected.size >= MAX_FOLDER_FILES,
+                    error = null,
+                )
+            }
+            if (result.files.isEmpty()) {
+                message(result.error?.let { "Couldn't read that folder" } ?: "That folder is empty")
+                return@launch
+            }
+            val added = mergeSelected(result.files, fromFolder = true)
+            if (result.capped && added > 0) {
+                message("Added the first $added files from this folder")
+            }
+        }
+    }
+
+    private fun mergeSelected(files: List<SelectedFile>, fromFolder: Boolean = false): Int {
+        if (files.isEmpty()) {
+            message("Couldn't read the selected files")
+            return 0
+        }
+        val current = _selectedFiles.value
+        val slots = (MAX_STAGED_FILES - current.size).coerceAtLeast(0)
+        if (slots == 0) {
+            message("Remove a file before adding more")
+            return 0
+        }
+        val keys = current.mapTo(mutableSetOf()) { it.key }
+        val merged = current.toMutableList()
+        var added = 0
+        for (file in files) {
+            if (added >= slots) break
+            if (keys.add(file.key)) {
+                merged += file
+                added++
+            }
+        }
+        if (added == 0) {
+            message(if (fromFolder) "Those files are already in the list" else "Already in the list")
+            return 0
+        }
+        _selectedFiles.value = merged
+        if (!fromFolder) {
+            message("${formatCount(added)} ready to send")
+        }
+        return added
+    }
+
+    private fun treeDisplayName(treeUri: Uri, documentId: String): String? = runCatching {
+        val documentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId)
+        app.contentResolver.query(
+            documentUri,
+            arrayOf(OpenableColumns.DISPLAY_NAME),
+            null,
+            null,
+            null,
+        )?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (index >= 0 && !cursor.isNull(index)) cursor.getString(index) else null
+            } else {
+                null
+            }
+        }
+    }.getOrNull()
+
+    private fun collectFolder(
+        treeUri: Uri,
+        documentId: String,
+        relativeRoot: String,
+        output: MutableList<SelectedFile>,
+        visited: MutableSet<String>,
+        depth: Int,
+    ) {
+        if (depth > MAX_FOLDER_DEPTH || output.size >= MAX_FOLDER_FILES) return
+        if (!visited.add(documentId)) return
+
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, documentId)
+        app.contentResolver.query(
+            childrenUri,
+            arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_SIZE,
+            ),
+            null,
+            null,
+            null,
+        )?.use { cursor ->
+            while (cursor.moveToNext() && output.size < MAX_FOLDER_FILES) {
+                val childId = cursor.getString(
+                    cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID),
+                )
+                val display = cursor.getString(
+                    cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+                )?.takeIf { it.isNotBlank() } ?: "File"
+                val mime = cursor.getString(
+                    cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE),
+                )
+                if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                    collectFolder(
+                        treeUri = treeUri,
+                        documentId = childId,
+                        relativeRoot = "$relativeRoot/${sanitizeSegment(display)}",
+                        output = output,
+                        visited = visited,
+                        depth = depth + 1,
+                    )
+                    continue
+                }
+
+                val sizeIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                val size = if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) {
+                    cursor.getLong(sizeIndex).coerceAtLeast(0L)
+                } else {
+                    0L
+                }
+                output += SelectedFile(
+                    uriString = DocumentsContract.buildDocumentUriUsingTree(treeUri, childId)
+                        .toString(),
+                    name = display,
+                    size = size,
+                    mimeType = mime,
+                    relativePath = "$relativeRoot/${sanitizeSegment(display)}",
+                )
+            }
+        }
+    }
+
+    private fun sanitizeSegment(value: String): String = value
+        .replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001F]"), "_")
+        .trim()
+        .trimEnd('.')
+        .take(MAX_SEGMENT_LENGTH)
+        .ifBlank { "Item" }
 
     fun removeFile(file: SelectedFile) {
         _selectedFiles.value = _selectedFiles.value.filterNot { it.key == file.key }
@@ -242,7 +405,7 @@ class AirBridgeViewModel(application: Application) : AndroidViewModel(applicatio
         _selectedFiles.value = emptyList()
     }
 
-    private fun describeDocument(uri: Uri): SelectedFile? = try {
+    private fun describeDocument(uri: Uri, relativePath: String? = null): SelectedFile? = try {
         var name: String? = null
         var size = -1L
         app.contentResolver.query(
@@ -271,6 +434,7 @@ class AirBridgeViewModel(application: Application) : AndroidViewModel(applicatio
             name = display,
             size = size.coerceAtLeast(0L),
             mimeType = app.contentResolver.getType(uri),
+            relativePath = relativePath ?: display,
         )
     } catch (t: Throwable) {
         null
@@ -531,5 +695,9 @@ class AirBridgeViewModel(application: Application) : AndroidViewModel(applicatio
 
     private companion object {
         const val MAX_REBIND_ATTEMPTS = 5
+        const val MAX_FOLDER_FILES = 500
+        const val MAX_FOLDER_DEPTH = 32
+        const val MAX_SEGMENT_LENGTH = 120
+        const val MAX_STAGED_FILES = 1_000
     }
 }

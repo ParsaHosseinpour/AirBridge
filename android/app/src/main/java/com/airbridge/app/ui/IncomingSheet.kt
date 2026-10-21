@@ -17,10 +17,13 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -34,6 +37,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
@@ -47,9 +51,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.airbridge.app.R
+import com.airbridge.app.model.IncomingFilePhase
+import com.airbridge.app.model.IncomingFileUi
 import com.airbridge.app.model.IncomingPhase
 import com.airbridge.app.model.IncomingTransferUi
 import com.airbridge.app.model.formatBytes
+import com.airbridge.app.model.formatCount
 import com.airbridge.app.ui.theme.Amber
 import com.airbridge.app.ui.theme.Danger
 import com.airbridge.app.ui.theme.Mint
@@ -116,11 +123,19 @@ fun IncomingTransferSheet(
 
             Spacer(Modifier.height(16.dp))
             if (incoming.phase == IncomingPhase.VERIFYING ||
-                incoming.phase == IncomingPhase.VERIFIED
+                incoming.phase == IncomingPhase.VERIFIED ||
+                incoming.pairingOnly
             ) {
                 IncomingVerificationDetails(incoming)
             } else {
                 IncomingDetails(incoming)
+                if (incoming.files.isNotEmpty()) {
+                    Spacer(Modifier.height(12.dp))
+                    IncomingFileList(
+                        rows = incoming.files,
+                        phase = incoming.phase,
+                    )
+                }
             }
 
             if (incoming.error != null &&
@@ -179,7 +194,11 @@ fun IncomingTransferSheet(
 
                 IncomingPhase.WAITING -> {
                     PrimaryActionButton(
-                        text = "Accept file",
+                        text = if (incoming.isBatch) {
+                            "Accept ${formatCount(incoming.files.size)}"
+                        } else {
+                            "Accept file"
+                        },
                         iconRes = R.drawable.ic_check,
                         onClick = onAccept,
                         modifier = Modifier.fillMaxWidth(),
@@ -204,10 +223,10 @@ fun IncomingTransferSheet(
 
                 IncomingPhase.READY -> {
                     PrimaryActionButton(
-                        text = if (incoming.error == null) {
-                            "Save to Downloads"
-                        } else {
-                            "Try saving again"
+                        text = when {
+                            incoming.error != null -> "Try saving again"
+                            incoming.isBatch -> "Save ${formatCount(incoming.files.size)} to Downloads"
+                            else -> "Save to Downloads"
                         },
                         iconRes = R.drawable.ic_check,
                         onClick = onAccept,
@@ -235,7 +254,11 @@ fun IncomingTransferSheet(
                         )
                         Spacer(Modifier.width(10.dp))
                         Text(
-                            text = "Saving to Downloads…",
+                            text = if (incoming.isBatch) {
+                                "Saving ${formatCount(incoming.files.size)} to Downloads…"
+                            } else {
+                                "Saving to Downloads…"
+                            },
                             color = TextPrimary,
                             fontSize = 14.sp,
                             fontWeight = FontWeight.Medium,
@@ -272,11 +295,19 @@ private fun IncomingDetails(incoming: IncomingTransferUi) {
         shape = RoundedCornerShape(18.dp),
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
-            IncomingInfoRow(
-                label = "File",
-                value = incoming.fileName,
-            )
-            Spacer(Modifier.height(10.dp))
+            if (incoming.isBatch) {
+                IncomingInfoRow(
+                    label = "Files",
+                    value = formatCount(incoming.files.size),
+                )
+                Spacer(Modifier.height(10.dp))
+            } else {
+                IncomingInfoRow(
+                    label = "File",
+                    value = incoming.fileName,
+                )
+                Spacer(Modifier.height(10.dp))
+            }
             IncomingInfoRow(
                 label = "Size",
                 value = when {
@@ -286,6 +317,16 @@ private fun IncomingDetails(incoming: IncomingTransferUi) {
                     else -> "Unknown until the transfer starts"
                 },
             )
+            if (incoming.isBatch) {
+                Spacer(Modifier.height(10.dp))
+                IncomingInfoRow(
+                    label = "Progress",
+                    value = buildString {
+                        append("${incoming.completedFiles} of ${incoming.files.size} files")
+                        incoming.etaText?.let { append(" · $it") }
+                    },
+                )
+            }
             Spacer(Modifier.height(10.dp))
             IncomingInfoRow(
                 label = "Destination",
@@ -293,6 +334,146 @@ private fun IncomingDetails(incoming: IncomingTransferUi) {
             )
         }
     }
+}
+
+/**
+ * Per-file rows for an inbound batch.
+ *
+ * The list has its own bounded scroll area: a folder offer can carry hundreds
+ * of manifest entries, and nesting an unconstrained list in the sheet's
+ * vertical scroll would compose every row at once.
+ */
+@Composable
+private fun IncomingFileList(rows: List<IncomingFileUi>, phase: IncomingPhase) {
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(max = 232.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        items(rows, key = { it.index }) { row ->
+            IncomingFileRow(row = row, phase = phase)
+        }
+    }
+}
+
+@Composable
+private fun IncomingFileRow(row: IncomingFileUi, phase: IncomingPhase) {
+    val color = incomingFileColor(row.phase)
+    val saving = phase == IncomingPhase.SAVING
+    val fraction = when (row.phase) {
+        IncomingFilePhase.PENDING -> 0f
+        IncomingFilePhase.ACTIVE -> row.progress ?: 0f
+        IncomingFilePhase.COMPLETED -> 1f
+        IncomingFilePhase.FAILED, IncomingFilePhase.CANCELLED -> row.progress ?: 0f
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(13.dp))
+            .background(Color.White.copy(alpha = 0.04f))
+            .padding(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(30.dp)
+                .clip(RoundedCornerShape(9.dp))
+                .background(color.copy(alpha = 0.12f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                painter = painterResource(incomingFileIcon(row.phase)),
+                contentDescription = null,
+                tint = color,
+                modifier = Modifier.size(15.dp),
+            )
+        }
+        Spacer(Modifier.width(9.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = row.name,
+                color = TextPrimary,
+                fontSize = 11.5.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = when {
+                    row.phase == IncomingFilePhase.FAILED && row.error != null -> row.error.orEmpty()
+                    row.savedUri != null -> "Downloads/AirBridge" +
+                        (row.folder?.let { "/$it" } ?: "")
+                    row.folder != null -> row.folder.orEmpty()
+                    else -> formatBytes(row.size)
+                },
+                color = if (row.phase == IncomingFilePhase.FAILED) Danger else TextMuted,
+                fontSize = 9.5.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (row.phase == IncomingFilePhase.ACTIVE && !saving) {
+                Spacer(Modifier.height(5.dp))
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(3.dp)
+                        .clip(CircleShape)
+                        .background(Color.White.copy(alpha = 0.08f)),
+                ) {
+                    if (fraction > 0f) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth(fraction)
+                                .height(3.dp)
+                                .clip(CircleShape)
+                                .background(color),
+                        )
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text = incomingFileStatus(row, phase),
+            color = color,
+            fontSize = 10.sp,
+            maxLines = 1,
+        )
+    }
+}
+
+private fun incomingFileStatus(row: IncomingFileUi, phase: IncomingPhase): String = when {
+    row.savedUri != null -> "Saved"
+    row.phase == IncomingFilePhase.COMPLETED ->
+        if (phase == IncomingPhase.SAVING) "Saving…" else "Received"
+    row.phase == IncomingFilePhase.ACTIVE ->
+        if (phase == IncomingPhase.SAVING) {
+            "Saving…"
+        } else {
+            row.progress?.let { "${Math.round(it * 100f)}%" } ?: "Receiving…"
+        }
+    row.phase == IncomingFilePhase.PENDING ->
+        if (phase == IncomingPhase.SAVING) "Waiting" else "Queued"
+    row.phase == IncomingFilePhase.FAILED -> "Failed"
+    row.phase == IncomingFilePhase.CANCELLED -> "Cancelled"
+    else -> ""
+}
+
+private fun incomingFileColor(phase: IncomingFilePhase): Color = when (phase) {
+    IncomingFilePhase.PENDING -> TextMuted
+    IncomingFilePhase.ACTIVE -> PrimaryCyan
+    IncomingFilePhase.COMPLETED -> Mint
+    IncomingFilePhase.FAILED -> Danger
+    IncomingFilePhase.CANCELLED -> TextMuted
+}
+
+private fun incomingFileIcon(phase: IncomingFilePhase): Int = when (phase) {
+    IncomingFilePhase.COMPLETED -> R.drawable.ic_check
+    IncomingFilePhase.FAILED -> R.drawable.ic_warning
+    IncomingFilePhase.CANCELLED -> R.drawable.ic_close
+    else -> R.drawable.ic_file
 }
 
 @Composable
@@ -532,11 +713,28 @@ private fun phaseIcon(phase: IncomingPhase): Int = when (phase) {
 private fun title(incoming: IncomingTransferUi): String = when (incoming.phase) {
     IncomingPhase.VERIFYING -> "Verify this device"
     IncomingPhase.VERIFIED -> "Device verified"
-    IncomingPhase.WAITING -> "Incoming file"
-    IncomingPhase.RECEIVING -> "Receiving…"
-    IncomingPhase.READY -> "Ready to save"
-    IncomingPhase.SAVING -> "Saving to Downloads"
-    IncomingPhase.SAVED -> "Saved to Downloads"
+    IncomingPhase.WAITING -> when {
+        incoming.isBatch -> "${incoming.files.size} incoming files"
+        else -> "Incoming file"
+    }
+    IncomingPhase.RECEIVING -> when {
+        incoming.isBatch -> "Receiving ${incoming.files.size} files"
+        else -> "Receiving…"
+    }
+    IncomingPhase.READY -> when {
+        incoming.isBatch -> "${incoming.completedFiles} files ready to save"
+        else -> "Ready to save"
+    }
+    IncomingPhase.SAVING -> if (incoming.isBatch) {
+        "Saving ${incoming.files.size} files"
+    } else {
+        "Saving to Downloads"
+    }
+    IncomingPhase.SAVED -> if (incoming.files.size > 1) {
+        "Saved ${incoming.completedFiles} files"
+    } else {
+        "Saved to Downloads"
+    }
     IncomingPhase.FAILED -> "Transfer failed"
     IncomingPhase.DECLINED -> "Transfer declined"
 }
@@ -546,16 +744,33 @@ private fun subtitle(incoming: IncomingTransferUi): String = when (incoming.phas
         "Compare this code with the other screen. Nothing is accepted until you confirm."
     IncomingPhase.VERIFIED ->
         "${incoming.peerIdHex ?: "The device"} is verified. No file was transferred."
-    IncomingPhase.WAITING ->
+    IncomingPhase.WAITING -> if (incoming.isBatch) {
+        "A nearby device wants to send ${formatCount(incoming.files.size)}. " +
+            "Nothing is saved until you accept."
+    } else {
         "A nearby device is sending this file. Nothing is saved until you accept."
-    IncomingPhase.RECEIVING ->
+    }
+    IncomingPhase.RECEIVING -> if (incoming.isBatch) {
+        "Keep AirBridge open. ${formatCount(incoming.remainingFiles)} still to receive" +
+            (incoming.etaText?.let { " · $it" } ?: "")
+    } else {
         "Keep AirBridge open until the transfer finishes."
-    IncomingPhase.READY ->
+    }
+    IncomingPhase.READY -> if (incoming.isBatch) {
+        "The files arrived intact. Save them to your public Downloads folder."
+    } else {
         "The file arrived intact. Save it to your public Downloads folder."
-    IncomingPhase.SAVING ->
+    }
+    IncomingPhase.SAVING -> if (incoming.isBatch) {
+        "Copying ${formatCount(incoming.files.size)} into Downloads/AirBridge."
+    } else {
         "Copying the verified file into Downloads/AirBridge."
-    IncomingPhase.SAVED ->
+    }
+    IncomingPhase.SAVED -> if (incoming.files.size > 1) {
+        "${incoming.savedName ?: "${incoming.completedFiles} files"} are in Downloads/AirBridge."
+    } else {
         "${incoming.savedName ?: incoming.fileName} is in Downloads/AirBridge."
+    }
     IncomingPhase.FAILED ->
         incoming.error ?: "The transfer didn't finish. Nothing was saved."
     IncomingPhase.DECLINED ->

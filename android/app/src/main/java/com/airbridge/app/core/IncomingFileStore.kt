@@ -34,7 +34,7 @@ class StoragePermissionRequiredException :
  * Commits a file the Rust receiver staged in the app cache into the device's
  * public Downloads collection.
  *
- * Why staging? [com.airbridge.core.FileTransferSession] receives into a
+ * Why staging? [com.airbridge.core.BatchTransferSession] receives into a
  * filesystem path, while MediaStore is a content-provider URI. There is no FD
  * hand-off in the FFI, so the verified staging file is streamed into
  * MediaStore only after the user approves it. Nothing is visible in Downloads
@@ -54,34 +54,60 @@ class IncomingFileStore(context: Context) {
     /**
      * Copies [source] into Downloads/AirBridge and returns the public URI.
      *
+     * [relativePath] is the manifest path of the received file. Its final
+     * segment becomes the display name and every parent segment becomes a
+     * subdirectory below `Downloads/AirBridge`, so a received folder keeps its
+     * shape instead of being flattened.
+     *
      * @throws StoragePermissionRequiredException on API 26-28 when
      *   `WRITE_EXTERNAL_STORAGE` has not been granted.
      */
-    fun save(source: File, displayName: String): SavedIncomingFile {
+    fun save(
+        source: File,
+        displayName: String,
+        relativePath: String = displayName,
+    ): SavedIncomingFile {
         if (!source.isFile) {
             throw IOException("The received file is no longer available")
         }
-        val safeName = sanitize(displayName)
+
+        val folders = relativeFolders(relativePath)
+        val name = relativePath
+            .replace('\\', '/')
+            .substringAfterLast('/')
+            .takeIf { it.isNotBlank() }
+            ?: displayName
+        val safeName = sanitize(name)
         if (requiresStoragePermission()) throw StoragePermissionRequiredException()
 
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            saveWithMediaStore(source, safeName)
+            saveWithMediaStore(source, safeName, folders)
         } else {
-            saveToLegacyDownloads(source, safeName)
+            saveToLegacyDownloads(source, safeName, folders)
         }
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
-    private fun saveWithMediaStore(source: File, displayName: String): SavedIncomingFile {
+    private fun saveWithMediaStore(
+        source: File,
+        displayName: String,
+        folders: List<String>,
+    ): SavedIncomingFile {
         val resolver = appContext.contentResolver
         val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        val relativeDirectory = buildString {
+            append(Environment.DIRECTORY_DOWNLOADS)
+            append('/')
+            append(DOWNLOAD_FOLDER)
+            folders.forEach { folder ->
+                append('/')
+                append(folder)
+            }
+        }
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
             put(MediaStore.MediaColumns.MIME_TYPE, IncomingFileKinds.mimeType(displayName))
-            put(
-                MediaStore.MediaColumns.RELATIVE_PATH,
-                "${Environment.DIRECTORY_DOWNLOADS}/$DOWNLOAD_FOLDER",
-            )
+            put(MediaStore.MediaColumns.RELATIVE_PATH, relativeDirectory)
             put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
 
@@ -106,11 +132,16 @@ class IncomingFileStore(context: Context) {
     }
 
     @Suppress("DEPRECATION")
-    private fun saveToLegacyDownloads(source: File, displayName: String): SavedIncomingFile {
+    private fun saveToLegacyDownloads(
+        source: File,
+        displayName: String,
+        folders: List<String>,
+    ): SavedIncomingFile {
         val downloads = Environment.getExternalStoragePublicDirectory(
             Environment.DIRECTORY_DOWNLOADS,
         )
-        val directory = File(downloads, DOWNLOAD_FOLDER)
+        var directory = File(downloads, DOWNLOAD_FOLDER)
+        folders.forEach { folder -> directory = File(directory, folder) }
         if (!directory.exists() && !directory.mkdirs()) {
             throw IOException("Could not create the Downloads/AirBridge folder")
         }
@@ -152,6 +183,30 @@ class IncomingFileStore(context: Context) {
             Manifest.permission.WRITE_EXTERNAL_STORAGE,
         ) == PackageManager.PERMISSION_GRANTED
 
+    /**
+     * Splits a manifest path into safe directory segments.
+     *
+     * The Rust receiver already rejects `..`, drive letters and absolute
+     * paths, but this is a second, storage-layer check: a path is never
+     * allowed to climb out of `Downloads/AirBridge`.
+     */
+    private fun relativeFolders(relativePath: String): List<String> =
+        relativePath
+            .replace('\\', '/')
+            .split('/')
+            .dropLast(1)
+            .asSequence()
+            .map(::sanitizeSegment)
+            .filter { it.isNotEmpty() && it != "." && it != ".." }
+            .take(MAX_FOLDER_DEPTH)
+            .toList()
+
+    private fun sanitizeSegment(segment: String): String = segment
+        .replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001F]"), "_")
+        .trim()
+        .trimEnd('.')
+        .take(MAX_SEGMENT_LENGTH)
+
     private fun sanitize(name: String): String {
         val cleaned = name
             .replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001F]"), "_")
@@ -164,6 +219,8 @@ class IncomingFileStore(context: Context) {
         const val DOWNLOAD_FOLDER = "AirBridge"
         private const val COPY_BUFFER_BYTES = 256 * 1024
         private const val MAX_NAME_LENGTH = 140
+        private const val MAX_SEGMENT_LENGTH = 120
+        private const val MAX_FOLDER_DEPTH = 32
         private const val MAX_UNIQUE_ATTEMPTS = 10_000
     }
 }

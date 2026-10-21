@@ -6,17 +6,19 @@ using Windows.Storage;
 
 namespace AirBridge.Windows.Models;
 
-/// <summary>A file chosen by the picker or dropped onto the radar.</summary>
+/// <summary>A file chosen by the picker, a folder walk, or a drop onto the radar.</summary>
 public sealed class StagedFile : ObservableObject
 {
     private string _path;
+    private string _relativePath;
 
-    private StagedFile(StorageFile? file, string path, string name, long size)
+    private StagedFile(StorageFile? file, string path, string name, long size, string relativePath)
     {
         File = file;
         _path = path;
         Name = name;
         Size = size;
+        _relativePath = Normalize(relativePath, name);
     }
 
     public StorageFile? File { get; }
@@ -31,28 +33,43 @@ public sealed class StagedFile : ObservableObject
 
     public long Size { get; }
 
-    public string SizeText => Format.Bytes(Size);
-
-    public string Glyph
+    /// <summary>
+    /// The `/`-separated path carried in the batch manifest. A folder
+    /// selection preserves the folder prefix (`album/one.jpg`); a single file
+    /// uses its own name. This is never the timestamped outgoing-cache name.
+    /// </summary>
+    public string RelativePath
     {
-        get
+        get => _relativePath;
+        private set
         {
-            var extension = System.IO.Path.GetExtension(Name).ToLowerInvariant();
-            return extension switch
+            if (SetProperty(ref _relativePath, value))
             {
-                ".png" or ".jpg" or ".jpeg" or ".gif" or ".webp" or ".heic" or ".bmp" or ".tif" or ".tiff" => "\uEB9F",
-                ".mp4" or ".mov" or ".mkv" or ".avi" or ".webm" or ".m4v" => "\uE714",
-                ".mp3" or ".wav" or ".flac" or ".m4a" or ".aac" or ".ogg" => "\uE8D6",
-                ".zip" or ".7z" or ".rar" or ".tar" or ".gz" => "\uE7B8",
-                ".pdf" => "\uEA90",
-                _ => "\uE8A5",
-            };
+                OnPropertiesChanged(nameof(Folder), nameof(DisplayPath), nameof(AutomationName));
+            }
         }
     }
 
-    public string AutomationName => $"{Name}, {SizeText}";
+    /// <summary>The containing folders inside the selected folder, if any.</summary>
+    public string? Folder
+    {
+        get
+        {
+            var slash = RelativePath.LastIndexOf('/');
+            return slash > 0 ? RelativePath[..slash] : null;
+        }
+    }
 
-    public static async Task<StagedFile> FromStorageFileAsync(StorageFile file)
+    public string DisplayPath => RelativePath;
+
+    public string SizeText => Format.Bytes(Size);
+
+    public string Glyph => FileKinds.GlyphFor(Name);
+
+    public string AutomationName =>
+        Folder is null ? $"{Name}, {SizeText}" : $"{Name} in {Folder}, {SizeText}";
+
+    public static async Task<StagedFile> FromStorageFileAsync(StorageFile file, string? relativePath = null)
     {
         long size = 0;
         try
@@ -65,13 +82,13 @@ public sealed class StagedFile : ObservableObject
             // A provider may not expose properties; the transfer still works.
         }
 
-        return new StagedFile(file, file.Path, file.Name, size);
+        return new StagedFile(file, file.Path, file.Name, size, relativePath ?? file.Name);
     }
 
-    public static StagedFile FromPath(string path)
+    public static StagedFile FromPath(string path, string? relativePath = null)
     {
         var info = new FileInfo(path);
-        return new StagedFile(null, path, info.Name, info.Exists ? info.Length : 0);
+        return new StagedFile(null, path, info.Name, info.Exists ? info.Length : 0, relativePath ?? info.Name);
     }
 
     /// <summary>
@@ -110,5 +127,15 @@ public sealed class StagedFile : ObservableObject
 
         Path = destination;
         return destination;
+    }
+
+    private static string Normalize(string? relativePath, string name)
+    {
+        var raw = string.IsNullOrWhiteSpace(relativePath) ? name : relativePath;
+        var segments = raw
+            .Replace('\\', '/')
+            .Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+        return segments.Length == 0 ? name : string.Join('/', segments);
     }
 }

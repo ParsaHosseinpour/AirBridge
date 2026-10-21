@@ -20,7 +20,8 @@ windows/
       NativeCore.cs                     safe native-library discovery and loading
       DiscoveryService.cs               PeerDiscoveryEngine lifecycle and events
       WindowsBleBackend.cs              WinRT BLE advertiser/scanner
-      TransferCoordinator.cs            serial send queue and secure receive loop
+      TransferCoordinator.cs            serial batch send queue and secure receive loop
+      BatchTransferEvents.cs            event pump from a native batch session
       SasService.cs                     compare-the-code prompt model
       FirewallService.cs                firewall rule status and elevated setup
       SettingsStore.cs                  settings and identity in %LOCALAPPDATA%
@@ -89,9 +90,11 @@ installer or MSIX registration is needed.
 
 * **Nearby** shows discovered devices on the radar and in the grid below it.
   Click a device (or its bubble) to select it as the send target.
-* **Send** accepts files dropped anywhere on the radar, dropped on the window,
-  or chosen with the file picker. Files are staged locally; **Clear** removes
-  them.
+* **Send** accepts files and folders dropped anywhere on the radar or window,
+  or chosen with **Choose files** / **Choose folder**. The staged list shows
+  each file's relative folder; **Clear** removes the whole selection. Sending
+  stages a folder as one batch, so nested paths arrive intact. Folder walks
+  stop after 1,000 files and 32 levels, and skip directory links.
 * **Verify pairing** opens the security-code dialog. Both devices show the
   same six-digit code from the P-256 handshake; approving it binds the other
   device's key fingerprint to its peer id. An already trusted device also has
@@ -99,8 +102,9 @@ installer or MSIX registration is needed.
   fingerprint if the other side legitimately rotated its key, and **Forget this
   device**, which removes the local binding. See
   [Secure pairing](#secure-pairing) below.
-* **Transfers** shows one circular progress ring per file. Pause, resume,
-  cancel, dismiss, and *Show in folder* are available as the transfer allows.
+* **Transfers** shows one card per batch with a ring, remaining-file count,
+  ETA, and a status row for every file. Cancel, dismiss, and *Show in folder*
+  are available as the transfer allows; batches cannot be paused.
 * **Sharing** turns the inbound listener on or off and shows the transfer port
   and firewall state. **Set up** launches the elevated firewall script.
 * **Settings** changes the display name, transfer port, download folder,
@@ -114,7 +118,8 @@ installer or MSIX registration is needed.
 | Settings | `%LOCALAPPDATA%\AirBridge\settings.json` |
 | Device identity | `%LOCALAPPDATA%\AirBridge\identity.pkcs8` |
 | Logs | `%LOCALAPPDATA%\AirBridge\logs\airbridge-YYYYMMDD.log` |
-| Received files | `%USERPROFILE%\Downloads\AirBridge` by default |
+| Received files | `%USERPROFILE%\Downloads\AirBridge` by default, with the sender's folder structure |
+| In-flight receives | `<download folder>\.airbridge-staging\<guid>` (removed after the batch ends) |
 
 Change the download folder in **Settings**. The **Downloads** and **Logs**
 buttons on the Sharing card open both folders in File Explorer.
@@ -149,15 +154,28 @@ discovery and keep listening as long as **Accept incoming files** is on.
 
 ### Transfers
 
-`TransferCoordinator` owns every `FileTransferSession`:
+`TransferCoordinator` owns every `BatchTransferSession`:
 
-* outgoing files are sent **one at a time** in a serial queue;
-* the receiver runs a long-lived accept loop on the configured port;
-* progress is marshalled to the UI thread and shown in the ring;
-* pause cancels the running session, keeps the receiver's part file, and
-  resumes with the *same payload id* so the sender seeks to the receiver's
-  verified prefix instead of starting over;
-* incoming connections that do not contain a valid AirBridge frame (port
+* a selection — one file, several files, a folder, or a mix — is queued as
+  **one batch**; batches run one at a time. Even a single file uses the batch
+  protocol, so both ends share one manifest/progress implementation;
+* the manifest carries `/`-separated relative paths. Folder picks keep their
+  top-level folder, duplicate and unsafe names are sanitized, and colliding
+  paths get a ` (2)`, ` (3)`, … suffix;
+* the whole batch is announced before the first payload byte, so the card shows
+  every file up front and then updates each row as it starts, completes, or
+  fails;
+* batch progress, remaining-file counts, and the linear ETA come from the Rust
+  engine and are marshalled to the UI thread;
+* cancel stops the entire batch at the next chunk boundary. The engine has no
+  freeze primitive, so there is no pause; sending again starts a fresh batch;
+* the receiver runs a long-lived accept loop on the configured port. Inbound
+  batches are staged under `.airbridge-staging`, verified in place, and only
+  then moved into the download folder with the sender's folder layout;
+* pairing and transfers share the listener port. A pairing-only connection is
+  a zero-file batch: the card confirms the verified device and dismisses
+  itself after a few seconds;
+* incoming connections that do not contain a valid AirBridge handshake (port
   scanners, HTTP probes) are ignored instead of being shown as failed
   transfers.
 
@@ -208,27 +226,34 @@ powershell -ExecutionPolicy Bypass -File windows/scripts/Setup-Firewall.ps1 -Rem
 
 ## Known limitations
 
-### Incoming file names
+### File names and folder layout
 
-The transport moves an anonymous byte stream and does not carry a filename.
-Received files are committed under a generated name (timestamp plus payload
-id), then renamed after verification with an extension guessed from the first
-bytes (PNG, JPEG, PDF, ZIP, MP4, plain text, and so on). Unknown content keeps
-a `.bin` extension. The friendlier name is shown in the transfer list and in
-the Downloads folder.
+Batch manifests carry each file's name and relative path, so received folders
+keep their internal structure under the download folder. The receiver still
+treats those paths as untrusted: every segment is checked for traversal,
+sanitized for Windows (illegal characters, reserved device names), and given a
+` (2)`, ` (3)`, … suffix if the destination already exists. Files are written
+to a private staging directory first, so a failed or cancelled batch never
+leaves partial files in Downloads.
 
-### Pause is resume-by-reconnect
+### Both devices need a batch-aware build
 
-The FFI has `Cancel()` but no freeze primitive. Pausing ends the current TCP
-session; resuming creates a new `FileTransferSession` with the original payload
-id. This is what makes pause genuinely resumable, but the peer must still be
-reachable when **Resume** is pressed.
+Transfers negotiate `MODE_BATCH`. A device still running the earlier
+single-file frontend cannot send to or receive from this build, because each
+side expects a batch manifest. Update both ends together; pairing-only
+connections continue to work between batch-aware builds.
+
+### No pause
+
+The batch FFI exposes `Cancel()` but no freeze primitive, so the transfer card
+has no pause button. Cancelling stops the whole batch and removes its staged
+payload; send the files again to start over.
 
 ### Single inbound transfer
 
 The receiver accepts one connection per session and then rebinds. Two senders
 targeting the same device are serialized naturally; a second connection may be
-refused while the first is active. Outbound files are queued by this app.
+refused while the first is active. Outbound batches are queued by this app.
 
 ### Windows BLE
 

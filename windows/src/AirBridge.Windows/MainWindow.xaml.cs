@@ -42,6 +42,7 @@ public sealed partial class MainWindow : Window
         _viewModel = new MainViewModel(DispatcherQueue, new SettingsStore());
         _viewModel.VerificationPrompt = ShowVerificationAsync;
         _viewModel.FilePicker = PickFilesAsync;
+        _viewModel.FolderPicker = PickFolderAsync;
         _viewModel.ScrollTransfersIntoView += OnScrollTransfersIntoView;
 
         RootGrid.DataContext = _viewModel;
@@ -215,7 +216,23 @@ public sealed partial class MainWindow : Window
         return files is null ? Array.Empty<StorageFile>() : files.ToArray();
     }
 
+    private async Task<StorageFolder?> PickFolderAsync()
+    {
+        var picker = new FolderPicker
+        {
+            SuggestedStartLocation = PickerLocationId.DocumentsLibrary,
+            ViewMode = PickerViewMode.List,
+        };
+
+        picker.FileTypeFilter.Add("*");
+        WinRT.Interop.InitializeWithWindow.Initialize(picker, _windowHandle);
+
+        return await picker.PickSingleFolderAsync();
+    }
+
     private async void OnBrowseClick(object sender, RoutedEventArgs args) => await _viewModel.PickFilesAsync();
+
+    private async void OnBrowseFolderClick(object sender, RoutedEventArgs args) => await _viewModel.PickFolderAsync();
 
     private async void OnBrowseRequested(object sender, EventArgs args) => await _viewModel.PickFilesAsync();
 
@@ -324,22 +341,6 @@ public sealed partial class MainWindow : Window
         finally
         {
             _dialogs.Release();
-        }
-    }
-
-    private void OnPauseTransferClick(object sender, RoutedEventArgs args)
-    {
-        if (TransferFrom(sender) is { } item)
-        {
-            _viewModel.PauseTransfer(item);
-        }
-    }
-
-    private void OnResumeTransferClick(object sender, RoutedEventArgs args)
-    {
-        if (TransferFrom(sender) is { } item)
-        {
-            _viewModel.ResumeTransfer(item);
         }
     }
 

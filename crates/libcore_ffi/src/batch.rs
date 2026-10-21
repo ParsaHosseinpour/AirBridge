@@ -30,7 +30,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex};
 
 use crate::cancel::{Canceller, WaitCancelled};
-use crate::crypto::MODE_BATCH;
+use crate::crypto::{MODE_BATCH, MODE_PAIRING};
 use crate::error::FfiError;
 use crate::runtime;
 use crate::transfer::{
@@ -602,6 +602,22 @@ impl BatchInner {
         let _ = stream.set_nodelay(true);
 
         let (stream, mode) = self.authenticate(stream, false).await?;
+        if mode == MODE_PAIRING {
+            // Pairing and transfers share one listener port. A pairing-only
+            // connection carries no manifest; completing normally lets the
+            // long-lived receiver re-arm without showing an empty batch.
+            return Ok(BatchReport {
+                batch_id: 0,
+                status: BatchPhase::Completed,
+                total_files: 0,
+                completed_files: 0,
+                failed_files: 0,
+                total_bytes: 0,
+                transferred_bytes: 0,
+                elapsed_ms: 0,
+                files: Vec::new(),
+            });
+        }
         if mode != MODE_BATCH {
             return Err(FfiError::Protocol {
                 message: "the peer did not request batch mode".to_owned(),
@@ -1176,7 +1192,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
-    use crate::crypto::{MODE_PAIRING, MODE_TRANSFER};
+    use crate::crypto::{PairingSession, MODE_PAIRING, MODE_TRANSFER};
     use libcore_crypto::{fingerprint_hex, Identity};
 
     struct TestIdentity {
@@ -1599,6 +1615,70 @@ mod tests {
             receiver_events.last(),
             Some(BatchEvent::Finished { report }) if report.completed_files == 2
         ));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pairing_connection_completes_a_batch_receiver_without_files() {
+        let sender_peer = crate::crypto::PeerIdentity::generate().unwrap();
+        let sender_fingerprint = sender_peer.fingerprint();
+        let receiver_identity = test_identity();
+        let port = free_port();
+        let root = temp_dir("pairing");
+
+        let receiver = BatchTransferSession::receive(
+            format!("127.0.0.1:{port}"),
+            root.join("destination").to_string_lossy().into_owned(),
+            options(&receiver_identity, "receiver", &[], None),
+        )
+        .unwrap();
+        let receiver_task = tokio::spawn(receiver.clone().run());
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let pairing = PairingSession::new(
+            format!("127.0.0.1:{port}"),
+            sender_peer,
+            "sender".to_owned(),
+            10_000,
+        )
+        .unwrap();
+        let challenge = pairing.clone().start().await.unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(10), receiver.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match event {
+            BatchEvent::VerificationRequired {
+                sas,
+                peer_fingerprint,
+                ..
+            } => {
+                assert_eq!(sas, challenge.sas);
+                assert_eq!(peer_fingerprint, sender_fingerprint);
+            }
+            other => panic!("expected a verification prompt, got {other:?}"),
+        }
+
+        receiver.confirm_peer().unwrap();
+        let result = pairing.confirm().await.unwrap();
+        assert_eq!(result.peer_id, "receiver");
+        assert_eq!(result.peer_fingerprint, receiver_identity.fingerprint);
+
+        let report = receiver_task.await.unwrap().unwrap();
+        assert_eq!(report.status, BatchPhase::Completed);
+        assert_eq!(report.total_files, 0);
+        assert_eq!(report.completed_files, 0);
+        assert_eq!(report.failed_files, 0);
+        assert!(report.files.is_empty());
+        assert_eq!(receiver.status(), BatchPhase::Completed);
+        assert_eq!(receiver.peer_id().as_deref(), Some("sender"));
+        assert_eq!(
+            receiver.peer_fingerprint().as_deref(),
+            Some(sender_fingerprint.as_str())
+        );
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
