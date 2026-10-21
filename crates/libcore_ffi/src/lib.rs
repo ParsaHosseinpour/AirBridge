@@ -10,12 +10,14 @@ uniffi::setup_scaffolding!();
 
 mod ble;
 mod cancel;
+mod crypto;
 mod discovery;
 mod error;
 mod runtime;
 mod transfer;
 
 pub use ble::{BleBackend, BleObservationSink, BleRequest};
+pub use crypto::{PairingChallenge, PairingResult, PairingSession, PeerIdentity};
 pub use discovery::{
     DiscoveryConfig, DiscoveryEvent, DiscoveryTier, PeerDiscoveryEngine, PeerInfo, SubnetPolicy,
     TierState,

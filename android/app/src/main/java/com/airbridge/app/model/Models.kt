@@ -31,6 +31,7 @@ enum class ShareDirection { SENDING, RECEIVING }
 
 enum class TransferPhase {
     CONNECTING,
+    VERIFYING,
     RUNNING,
     CANCELLING,
     COMPLETED,
@@ -53,6 +54,10 @@ data class TransferUi(
     val error: String? = null,
     val queueIndex: Int = 1,
     val queueSize: Int = 1,
+    /** Six-digit code to compare while [phase] is [TransferPhase.VERIFYING]. */
+    val sas: String? = null,
+    /** Fingerprint the peer presented once its handshake completed. */
+    val peerFingerprint: String? = null,
 ) {
     val progress: Float?
         get() = totalBytes
@@ -77,6 +82,12 @@ data class TransferUi(
  * Nothing leaves the app's cache until [SAVED].
  */
 enum class IncomingPhase {
+    /**
+     * The handshake finished and the user must compare the SAS with the
+     * other device. No payload bytes have been accepted yet.
+     */
+    VERIFYING,
+
     /** A peer connected. The user has not accepted or declined yet. */
     WAITING,
 
@@ -92,22 +103,27 @@ enum class IncomingPhase {
     /** The file is in the public Downloads collection. */
     SAVED,
 
+    /** A pairing-only connection finished; no file was involved. */
+    VERIFIED,
+
     /** The transfer or the save failed. */
     FAILED,
 
     /** The user declined the transfer. */
     DECLINED;
 
-    val isTerminal: Boolean get() = this == SAVED || this == FAILED || this == DECLINED
-    val isAwaitingConsent: Boolean get() = this == WAITING || this == READY
+    val isTerminal: Boolean
+        get() = this == SAVED || this == VERIFIED || this == FAILED || this == DECLINED
+    val isAwaitingConsent: Boolean get() = this == VERIFYING || this == WAITING || this == READY
 }
 
 /**
  * Everything the incoming-transfer card needs.
  *
- * The AirBridge wire protocol deliberately carries no filename or peer
- * identity. [fileName] is a friendly name generated locally after the payload
- * is verified; until then the UI says "Incoming file".
+ * The payload carries no filename. [fileName] is a friendly name generated
+ * locally after the payload is verified; until then the UI says "Incoming
+ * file". [sas] and [peerFingerprint] are available as soon as the handshake
+ * completes, before any payload bytes are accepted.
  */
 data class IncomingTransferUi(
     /** Locally unique id for this offer, used to ignore stale events. */
@@ -119,6 +135,16 @@ data class IncomingTransferUi(
     val error: String? = null,
     val savedName: String? = null,
     val savedUri: String? = null,
+    /** Six-digit code to compare before the payload is accepted. */
+    val sas: String? = null,
+    /** Authenticated peer id, delivered only after the handshake. */
+    val peerIdHex: String? = null,
+    /** Fingerprint the peer was authenticated against. */
+    val peerFingerprint: String? = null,
+    /** True after "Codes match" until the FFI releases the channel. */
+    val verificationSent: Boolean = false,
+    /** True when this connection only verified the device and moved no file. */
+    val pairingOnly: Boolean = false,
 ) {
     /**
      * Progress in `0f..1f` once the payload size is known.

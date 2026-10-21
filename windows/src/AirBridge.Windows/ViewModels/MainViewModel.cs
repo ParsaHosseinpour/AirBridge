@@ -30,16 +30,19 @@ namespace AirBridge.Windows.ViewModels;
 /// </summary>
 public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 {
+    private const ulong PairingTimeoutMs = 30_000;
+
     private readonly DispatcherQueue _dispatcher;
     private readonly SettingsStore _store;
     private readonly DiscoveryService _discovery = new();
     private readonly TransferCoordinator _coordinator;
     private readonly FirewallService _firewall = new();
-    private readonly ISasGateway _sas = new LocalPreviewSasGateway();
     private readonly Dictionary<string, PeerDevice> _peerIndex = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<TransferItem> _observedTransfers = new();
 
     private AppSettings _settings;
+    private PeerIdentity? _identity;
+    private byte[]? _identityPkcs8;
     private bool _initialized;
     private bool _disposed;
 
@@ -73,7 +76,11 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _settings = _store.Load();
-        _coordinator = new TransferCoordinator(dispatcher, () => _settings);
+        _coordinator = new TransferCoordinator(
+            dispatcher,
+            () => _settings,
+            () => _identityPkcs8,
+            peerId => _peerIndex.TryGetValue(peerId, out var peer) ? peer.Name : null);
 
         _displayName = _settings.DisplayName;
         _receiverStatusColor = _settings.ReceiveEnabled ? "#FF9FE7FF" : "#FF9DB2C4";
@@ -94,8 +101,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         Attach();
     }
 
-    /// <summary>Set by the window: shows the SAS dialog and returns the user's answer.</summary>
-    public Func<PeerDevice, SasChallenge, Task<bool>>? VerificationPrompt { get; set; }
+    /// <summary>Set by the window: shows the real SAS dialog and returns the user's answer.</summary>
+    public Func<SasPrompt, Task<bool>>? VerificationPrompt { get; set; }
 
     /// <summary>Set by the window: opens the file picker and returns the chosen files.</summary>
     public Func<Task<IReadOnlyList<StorageFile>>>? FilePicker { get; set; }
@@ -111,8 +118,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public ObservableCollection<TierInfo> Tiers { get; }
 
     public AppSettings Settings => _settings;
-
-    public bool IsPairingPreview => _sas.IsPreview;
 
     public string AppVersion { get; } =
         Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "1.0.0";
@@ -143,7 +148,13 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public bool NativeReady
     {
         get => _nativeReady;
-        private set => SetProperty(ref _nativeReady, value);
+        private set
+        {
+            if (SetProperty(ref _nativeReady, value))
+            {
+                OnPropertiesChanged(nameof(CanSend), nameof(CanVerifySelectedPeer));
+            }
+        }
     }
 
     public string StatusText
@@ -215,7 +226,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 nameof(SelectedPeerName),
                 nameof(SelectedPeerDetail),
                 nameof(SendButtonText),
-                nameof(CanSend));
+                nameof(CanSend),
+                nameof(CanVerifySelectedPeer));
         }
     }
 
@@ -252,6 +264,13 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     }
 
     public bool CanSend => SelectedPeer is not null && StagedFiles.Count > 0 && !IsBusy && _nativeReady;
+
+    /// <summary>
+    /// True when the selected device is already trusted but the user wants to
+    /// compare its code again, e.g. after a suspected key change or reinstall.
+    /// </summary>
+    public bool CanVerifySelectedPeer =>
+        SelectedPeer is { HasAddress: true, IsTrusted: true } && !IsBusy && _nativeReady;
 
     public bool HasStagedFiles
     {
@@ -345,7 +364,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         {
             if (SetProperty(ref _isBusy, value))
             {
-                OnPropertiesChanged(nameof(CanSend));
+                OnPropertiesChanged(nameof(CanSend), nameof(CanVerifySelectedPeer));
             }
         }
     }
@@ -370,27 +389,36 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             ShowBanner(
                 native.Error ?? "The native AirBridge core is unavailable.",
                 NoticeSeverity.Error);
-        }
 
-        _coordinator.Start(_settings);
-
-        if (native.Available)
-        {
-            if (_settings.AutoScanOnLaunch)
-            {
-                await Task.Run(() => _discovery.StartAsync(_settings)).ConfigureAwait(true);
-            }
-            else
-            {
-                SetIdleState();
-            }
-        }
-        else
-        {
             StatusText = "Native core unavailable";
             StatusColor = "#FFFF6B7A";
             StatusDetail = native.Error ?? "The native AirBridge core is unavailable.";
             IsScanning = false;
+            await RefreshFirewallStatusAsync().ConfigureAwait(true);
+            return;
+        }
+
+        if (!TryEnsureIdentity())
+        {
+            NativeReady = false;
+            NativeStatusText = "Native core ready, but the device identity could not be created.";
+            StatusText = "Identity unavailable";
+            StatusColor = "#FFFF6B7A";
+            StatusDetail = "AirBridge could not create the long-lived identity key required for secure pairing.";
+            IsScanning = false;
+            await RefreshFirewallStatusAsync().ConfigureAwait(true);
+            return;
+        }
+
+        _coordinator.Start(_settings);
+
+        if (_settings.AutoScanOnLaunch)
+        {
+            await Task.Run(() => _discovery.StartAsync(_settings)).ConfigureAwait(true);
+        }
+        else
+        {
+            SetIdleState();
         }
 
         await RefreshFirewallStatusAsync().ConfigureAwait(true);
@@ -475,6 +503,55 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         _disposed = true;
         await _coordinator.DisposeAsync().ConfigureAwait(false);
         await _discovery.DisposeAsync().ConfigureAwait(false);
+
+        _identityPkcs8 = null;
+        _identity?.Dispose();
+        _identity = null;
+    }
+
+    /// <summary>
+    /// Loads the persistent P-256 identity once the native core is loaded, or
+    /// creates it on first launch. The PKCS#8 bytes never leave the machine.
+    /// </summary>
+    private bool TryEnsureIdentity()
+    {
+        if (_identity is not null && _identityPkcs8 is { Length: > 0 })
+        {
+            return true;
+        }
+
+        try
+        {
+            var stored = _store.LoadIdentity();
+            if (stored is { Length: > 0 })
+            {
+                try
+                {
+                    _identity = PeerIdentity.FromPkcs8(stored);
+                }
+                catch (Exception error)
+                {
+                    AppLog.Warn("The stored identity is unusable; generating a new one.", error);
+                }
+            }
+
+            if (_identity is null)
+            {
+                _identity = PeerIdentity.Generate();
+                _store.SaveIdentity(_identity.ToPkcs8());
+            }
+
+            _identityPkcs8 = _identity.ToPkcs8();
+            return true;
+        }
+        catch (Exception error)
+        {
+            AppLog.Error("Could not create the device identity.", error);
+            ShowBanner(
+                $"The secure device identity could not be created: {Format.FriendlyException(error)}",
+                NoticeSeverity.Error);
+            return false;
+        }
     }
 
     private void Attach()
@@ -487,6 +564,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
         _coordinator.Notice += (_, notice) => Dispatch(() => ShowBanner(notice.Message, notice.Severity));
         _coordinator.ReceiverStateChanged += (_, _) => Dispatch(UpdateReceiverStatus);
+        _coordinator.VerificationPrompt = PromptForVerificationAsync;
+        _coordinator.PeerVerified += (_, args) => Dispatch(() => OnPeerVerified(args));
 
         Transfers.CollectionChanged += OnTransfersChanged;
         StagedFiles.CollectionChanged += OnStagedFilesChanged;
@@ -927,54 +1006,189 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
-    private async Task<bool> EnsureVerifiedAsync(PeerDevice peer)
+    /// <summary>
+    /// Re-runs the SAS handshake with the selected trusted device. Approving it
+    /// replaces the pinned fingerprint if the other side legitimately rotated
+    /// its key; declining leaves the existing trust unchanged.
+    /// </summary>
+    public async Task VerifySelectedPeerAsync()
     {
-        if (peer.IsTrusted)
+        var peer = SelectedPeer;
+        if (peer is null || !peer.HasAddress || IsBusy || !NativeReady)
         {
-            return true;
+            return;
         }
 
-        var challenge = await _sas.ChallengeAsync(peer.IdHex);
-
-        var prompt = VerificationPrompt;
-        if (prompt is null)
+        IsBusy = true;
+        try
         {
-            return true;
+            await EnsureVerifiedAsync(peer, force: true);
         }
-
-        if (!await prompt(peer, challenge))
+        finally
         {
-            ShowBanner("Verification cancelled \u2014 nothing was sent.", NoticeSeverity.Warning);
-            return false;
+            IsBusy = false;
         }
-
-        if (!await _sas.ApproveAsync(challenge))
-        {
-            ShowBanner("The pairing code expired. Try again.", NoticeSeverity.Warning);
-            return false;
-        }
-
-        if (_sas.IsPreview)
-        {
-            ShowBanner(
-                $"Preview PIN accepted for {peer.Name}. Cryptographic pairing is not available in this build, so the device is not remembered as verified.",
-                NoticeSeverity.Warning);
-        }
-        else
-        {
-            peer.IsTrusted = true;
-            _settings.Trust(peer.IdHex);
-            _store.Save(_settings);
-            ShowBanner($"{peer.Name} is now a verified device.", NoticeSeverity.Success);
-        }
-
-        return true;
     }
 
-    public async Task<SasChallenge> CreateChallengeAsync(PeerDevice peer) =>
-        await _sas.ChallengeAsync(peer.IdHex);
+    /// <summary>
+    /// Runs a real pairing handshake with <paramref name="peer"/> and stores
+    /// trust against the fingerprint of its identity key. Trust is never keyed
+    /// by the discovered peer id alone.
+    /// </summary>
+    private async Task<bool> EnsureVerifiedAsync(PeerDevice peer, bool force = false)
+    {
+        if (!force && _settings.IsTrusted(peer.IdHex))
+        {
+            peer.IsTrusted = true;
+            return true;
+        }
 
-    public Task<bool> ApproveChallengeAsync(SasChallenge challenge) => _sas.ApproveAsync(challenge);
+        if (!peer.HasAddress)
+        {
+            ShowBanner($"{peer.Name} has no reachable address yet.", NoticeSeverity.Warning);
+            return false;
+        }
+
+        if (!TryEnsureIdentity() || _identity is null)
+        {
+            ShowBanner("The device identity is not ready yet. Restart AirBridge and try again.", NoticeSeverity.Error);
+            return false;
+        }
+
+        var identity = _identity;
+        PairingSession? session = null;
+        try
+        {
+            session = new PairingSession(
+                peer.PrimaryAddress,
+                identity,
+                _settings.PeerIdHex ?? string.Empty,
+                PairingTimeoutMs);
+
+            var challenge = await session.Start();
+            var handler = VerificationPrompt;
+            var prompt = new SasPrompt(
+                challenge.Sas,
+                challenge.PeerFingerprint,
+                peer.Name,
+                $"{peer.DeviceLabel} \u00B7 {peer.AddressText}",
+                isIncoming: false,
+                glyph: peer.Glyph);
+
+            if (handler is null || !await handler(prompt))
+            {
+                await RejectPairingAsync(session);
+                ShowBanner("Verification cancelled \u2014 nothing was sent.", NoticeSeverity.Warning);
+                return false;
+            }
+
+            var result = await session.Confirm();
+            if (!string.Equals(result.PeerId, peer.IdHex, StringComparison.OrdinalIgnoreCase))
+            {
+                ShowBanner(
+                    "The device answered with a different identity. Trust was not saved.",
+                    NoticeSeverity.Warning);
+                return false;
+            }
+
+            _settings.Trust(result.PeerId, result.PeerFingerprint);
+            _store.Save(_settings);
+            peer.IsTrusted = true;
+            OnPropertiesChanged(
+                nameof(SelectedPeerDetail),
+                nameof(SendButtonText),
+                nameof(CanSend));
+            ShowBanner($"{peer.Name} is now a verified device.", NoticeSeverity.Success);
+            return true;
+        }
+        catch (FfiException.VerificationRejected)
+        {
+            ShowBanner("The security code was declined or the pairing timed out.", NoticeSeverity.Warning);
+            return false;
+        }
+        catch (Exception error)
+        {
+            AppLog.Warn("Pairing failed.", error);
+            ShowBanner($"Could not verify {peer.Name}: {Format.FriendlyException(error)}", NoticeSeverity.Error);
+            return false;
+        }
+        finally
+        {
+            session?.Dispose();
+        }
+    }
+
+    private static async Task RejectPairingAsync(PairingSession session)
+    {
+        try
+        {
+            await session.Reject();
+        }
+        catch (Exception error)
+        {
+            AppLog.Warn("The pairing connection did not close cleanly.", error);
+        }
+    }
+
+    /// <summary>Shows the SAS dialog on the UI thread for the coordinator.</summary>
+    private Task<bool> PromptForVerificationAsync(SasPrompt prompt)
+    {
+        var handler = VerificationPrompt;
+        if (handler is null)
+        {
+            return Task.FromResult(false);
+        }
+
+        if (_dispatcher.HasThreadAccess)
+        {
+            return RunPromptAsync(handler, prompt);
+        }
+
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_dispatcher.TryEnqueue(async () => completion.TrySetResult(await RunPromptAsync(handler, prompt))))
+        {
+            completion.TrySetResult(false);
+        }
+
+        return completion.Task;
+    }
+
+    private static async Task<bool> RunPromptAsync(Func<SasPrompt, Task<bool>> handler, SasPrompt prompt)
+    {
+        try
+        {
+            return await handler(prompt);
+        }
+        catch (Exception error)
+        {
+            AppLog.Error("The verification prompt failed.", error);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Applies an authenticated id-to-fingerprint binding. Only called after
+    /// the user confirmed the SAS (or a previously trusted key auto-confirmed).
+    /// </summary>
+    private void OnPeerVerified(PeerVerifiedEventArgs args)
+    {
+        var wasTrusted = _settings.TrustedFingerprints.Contains(args.PeerFingerprint);
+        _settings.Trust(args.PeerId, args.PeerFingerprint);
+        _store.Save(_settings);
+
+        if (_peerIndex.TryGetValue(args.PeerId, out var peer))
+        {
+            peer.IsTrusted = true;
+        }
+
+        OnPropertiesChanged(nameof(SelectedPeerDetail), nameof(SendButtonText), nameof(CanSend));
+
+        if (!wasTrusted)
+        {
+            var name = peer?.Name ?? Format.ShortId(args.PeerId);
+            ShowBanner($"{name} is now a verified device.", NoticeSeverity.Success);
+        }
+    }
 
     public void PauseTransfer(TransferItem item) => _coordinator.Pause(item);
 

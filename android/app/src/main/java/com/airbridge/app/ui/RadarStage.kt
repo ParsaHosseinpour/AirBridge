@@ -539,6 +539,10 @@ private fun transferColor(transfer: TransferUi): Color = when (transfer.phase) {
 
 private fun transferStatus(transfer: TransferUi): String = when (transfer.phase) {
     TransferPhase.CONNECTING -> "Connecting…"
+    TransferPhase.VERIFYING -> {
+        val code = transfer.sas
+        if (code != null) "Verify ${code.filter(Char::isDigit).chunked(3).joinToString(" ")}" else "Verify device"
+    }
     TransferPhase.RUNNING -> {
         val percent = transfer.percent
         if (percent != null) "${transfer.verb} $percent%" else "${transfer.verb}…"

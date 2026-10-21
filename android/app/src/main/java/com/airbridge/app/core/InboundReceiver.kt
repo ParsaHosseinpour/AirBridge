@@ -61,7 +61,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 class InboundReceiver(
     context: Context,
     private val scope: CoroutineScope,
+    private val preferences: AppPreferences,
     private val notify: (String) -> Unit,
+    private val onPeerVerified: (peerId: String, fingerprint: String) -> Unit,
 ) {
     private val appContext = context.applicationContext
     private val stagingDirectory = File(appContext.cacheDir, STAGING_DIRECTORY)
@@ -140,9 +142,23 @@ class InboundReceiver(
 
     /** User approved the current offer. */
     fun accept() {
+        var verificationSession: FileTransferSession? = null
         synchronized(lock) {
             val current = _incoming.value ?: return
             when (current.phase) {
+                IncomingPhase.VERIFYING -> {
+                    if (current.verificationSent) return
+                    // The user has both confirmed the device and accepted the
+                    // file. Remember that before releasing the channel: the
+                    // `Started` event follows immediately and must not regress
+                    // this card back to the file-offer prompt.
+                    accepted = true
+                    _incoming.value = current.copy(
+                        verificationSent = true,
+                        error = null,
+                    )
+                    verificationSession = activeSession
+                }
                 IncomingPhase.WAITING -> {
                     accepted = true
                     consentJob?.cancel()
@@ -157,7 +173,25 @@ class InboundReceiver(
                     )
                     pendingDecision?.complete(true)
                 }
+                IncomingPhase.VERIFIED, IncomingPhase.SAVED,
+                IncomingPhase.FAILED, IncomingPhase.DECLINED -> {
+                    _incoming.value = null
+                }
                 else -> Unit
+            }
+        }
+        val session = verificationSession ?: return
+        val failure = runCatching { session.confirmPeer() }.exceptionOrNull()
+        if (failure != null) {
+            synchronized(lock) {
+                val current = _incoming.value
+                if (current?.phase == IncomingPhase.VERIFYING) {
+                    accepted = false
+                    _incoming.value = current.copy(
+                        verificationSent = false,
+                        error = friendlyError(failure),
+                    )
+                }
             }
         }
     }
@@ -169,6 +203,12 @@ class InboundReceiver(
         synchronized(lock) {
             val current = _incoming.value ?: return
             when (current.phase) {
+                IncomingPhase.VERIFYING -> {
+                    accepted = false
+                    declinedOfferId = current.id
+                    session = activeSession
+                    _incoming.value = null
+                }
                 IncomingPhase.WAITING, IncomingPhase.RECEIVING -> {
                     accepted = false
                     declinedOfferId = current.id
@@ -181,7 +221,8 @@ class InboundReceiver(
                     pendingDecision?.complete(false)
                     _incoming.value = null
                 }
-                IncomingPhase.SAVED, IncomingPhase.FAILED, IncomingPhase.DECLINED -> {
+                IncomingPhase.VERIFIED, IncomingPhase.SAVED,
+                IncomingPhase.FAILED, IncomingPhase.DECLINED -> {
                     _incoming.value = null
                 }
                 IncomingPhase.SAVING -> return
@@ -234,6 +275,9 @@ class InboundReceiver(
                             verifyWholeFile = true,
                             acceptTimeoutMs = ACCEPT_TIMEOUT_MS.toULong(),
                             progressIntervalMs = PROGRESS_INTERVAL_MS.toULong(),
+                            identityPkcs8 = preferences.identityPkcs8,
+                            localPeerId = preferences.peerIdHex,
+                            trustedPeerFingerprints = preferences.trustedFingerprints().toList(),
                         ),
                     )
                 }
@@ -315,6 +359,43 @@ class InboundReceiver(
         event: TransferEvent,
     ) {
         when (event) {
+            is TransferEvent.VerificationRequired -> {
+                val shown = synchronized(lock) {
+                    if (currentOfferId != offerId || declinedOfferId == offerId) {
+                        false
+                    } else {
+                        val current = _incoming.value?.takeIf { it.id == offerId }
+                        _incoming.value = (current ?: IncomingTransferUi(id = offerId)).copy(
+                            phase = IncomingPhase.VERIFYING,
+                            sas = event.sas,
+                            peerFingerprint = event.peerFingerprint,
+                            error = null,
+                            verificationSent = false,
+                        )
+                        true
+                    }
+                }
+                if (shown && sessionActive) acquireWakeLock()
+            }
+            is TransferEvent.PeerVerified -> {
+                val accepted = synchronized(lock) {
+                    if (currentOfferId != offerId || declinedOfferId == offerId) {
+                        false
+                    } else {
+                        val current = _incoming.value?.takeIf { it.id == offerId }
+                        if (current == null) {
+                            false
+                        } else {
+                            _incoming.value = current.copy(
+                                peerIdHex = event.peerId,
+                                peerFingerprint = event.peerFingerprint,
+                            )
+                            true
+                        }
+                    }
+                }
+                if (accepted) onPeerVerified(event.peerId, event.peerFingerprint)
+            }
             is TransferEvent.Started -> {
                 ensureOffer(offerId, staging, announced, event.totalBytes?.toLong())
             }
@@ -361,6 +442,7 @@ class InboundReceiver(
                 if (declinedOfferId == offerId) return
                 val existing = _incoming.value
                 if (existing?.id == offerId &&
+                    existing.phase != IncomingPhase.VERIFYING &&
                     existing.phase != IncomingPhase.WAITING &&
                     existing.phase != IncomingPhase.RECEIVING
                 ) {
@@ -369,10 +451,11 @@ class InboundReceiver(
                     return
                 }
                 waiting = !accepted
-                _incoming.value = IncomingTransferUi(
-                    id = offerId,
+                val base = _incoming.value?.takeIf { it.id == offerId }
+                _incoming.value = (base ?: IncomingTransferUi(id = offerId)).copy(
                     totalBytes = total,
                     phase = if (accepted) IncomingPhase.RECEIVING else IncomingPhase.WAITING,
+                    verificationSent = false,
                 )
             }
             if (!sessionActive) return
@@ -432,6 +515,11 @@ class InboundReceiver(
         consentJob?.cancel()
         consentJob = null
         lastListenerError = null
+
+        if (report.pairingOnly) {
+            finishPairingOnly(offerId, report)
+            return
+        }
 
         val total = report.totalBytes.toLong().coerceAtLeast(0L)
         val extension = withContext(Dispatchers.IO) { IncomingFileKinds.sniffExtension(staging) }
@@ -542,6 +630,39 @@ class InboundReceiver(
     }
 
     /**
+     * Completes a pairing-only connection: the peer was authenticated, but
+     * there is no file to offer or save.
+     */
+    private fun finishPairingOnly(offerId: String, report: TransferReport) {
+        val peerId = report.peerId
+        val fingerprint = report.peerFingerprint
+        if (peerId != null && fingerprint != null) {
+            onPeerVerified(peerId, fingerprint)
+        }
+        synchronized(lock) {
+            if (currentOfferId != offerId) return
+            if (declinedOfferId == offerId) {
+                _incoming.value = null
+                return
+            }
+            val current = _incoming.value?.takeIf { it.id == offerId }
+                ?: IncomingTransferUi(id = offerId)
+            _incoming.value = current.copy(
+                phase = IncomingPhase.VERIFIED,
+                pairingOnly = true,
+                peerIdHex = peerId ?: current.peerIdHex,
+                peerFingerprint = fingerprint ?: current.peerFingerprint,
+                bytesTransferred = 0,
+                totalBytes = null,
+                error = null,
+                verificationSent = false,
+            )
+        }
+        notify("Device verified")
+        scheduleAutoDismiss(offerId)
+    }
+
+    /**
      * Handles an unsuccessful session.
      *
      * @return true when the listener should back off before rebinding (bind
@@ -559,6 +680,13 @@ class InboundReceiver(
         val cancelled = error is FfiException.Cancelled
         val current = _incoming.value
         val hadOffer = announced.get() || current?.id == offerId
+
+        if (declinedOfferId == offerId) {
+            synchronized(lock) {
+                if (_incoming.value?.id == offerId) _incoming.value = null
+            }
+            return false
+        }
 
         if (!hadOffer) {
             if (error is FfiException.Timeout) {
@@ -616,7 +744,9 @@ class InboundReceiver(
             synchronized(lock) {
                 val current = _incoming.value
                 if (current?.id == offerId &&
-                    (current.phase == IncomingPhase.SAVED || current.phase == IncomingPhase.FAILED)
+                    (current.phase == IncomingPhase.SAVED ||
+                        current.phase == IncomingPhase.VERIFIED ||
+                        current.phase == IncomingPhase.FAILED)
                 ) {
                     _incoming.value = null
                 }
@@ -670,6 +800,11 @@ class InboundReceiver(
         is FfiException.PeerClosed -> "The other device disconnected"
         is FfiException.PeerAborted -> "The other device cancelled the transfer"
         is FfiException.ChecksumMismatch -> "A checksum did not match"
+        is FfiException.Crypto -> error.message.ifBlank { "Secure connection failed" }
+        is FfiException.IdentityMismatch ->
+            "The other device presented a different security key"
+        is FfiException.VerificationRejected -> "Verification was declined"
+        is FfiException.AlreadyFinished -> "This verification is no longer available"
         is FfiException.Io -> error.message.ifBlank { "A network error interrupted the transfer" }
         is FfiException.Protocol -> "The other device sent invalid data"
         is UnsatisfiedLinkError -> "The native core is missing for this device's ABI"

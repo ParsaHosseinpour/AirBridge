@@ -85,6 +85,13 @@ pub enum TransferError {
 
     /// The system random number generator failed.
     Random,
+
+    /// The cryptographic handshake or the encrypted channel failed.
+    ///
+    /// This covers authentication failures, replayed or reordered frames, and
+    /// a malformed handshake message. The variants inside
+    /// [`libcore_crypto::CryptoError`] carry the precise reason.
+    Crypto(libcore_crypto::CryptoError),
 }
 
 impl From<io::Error> for TransferError {
@@ -128,6 +135,7 @@ impl fmt::Display for TransferError {
                 write!(f, "invalid chunk size: {size}")
             }
             Self::Random => f.write_str("system random number generator failure"),
+            Self::Crypto(error) => write!(f, "cryptographic failure: {error}"),
         }
     }
 }
@@ -136,6 +144,7 @@ impl std::error::Error for TransferError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::Crypto(error) => Some(error),
             _ => None,
         }
     }

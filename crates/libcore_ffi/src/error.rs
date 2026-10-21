@@ -117,6 +117,24 @@ pub enum FfiError {
         message: String,
     },
 
+    /// The cryptographic handshake or the encrypted channel failed.
+    Crypto {
+        /// Human-readable detail.
+        message: String,
+    },
+
+    /// The peer presented a different identity key than the one pinned.
+    IdentityMismatch {
+        /// Fingerprint the caller expected.
+        expected: String,
+        /// Fingerprint the peer presented.
+        actual: String,
+    },
+
+    /// The user declined the displayed authentication code, or the pending
+    /// verification disappeared before a decision.
+    VerificationRejected,
+
     /// An internal invariant failed (runtime unavailable, task panicked).
     Internal {
         /// Human-readable detail.
@@ -155,6 +173,9 @@ impl FfiError {
             Self::ChecksumMismatch { .. } => "checksum_mismatch",
             Self::PeerAborted { .. } => "peer_aborted",
             Self::Discovery { .. } => "discovery",
+            Self::Crypto { .. } => "crypto",
+            Self::IdentityMismatch { .. } => "identity_mismatch",
+            Self::VerificationRejected => "verification_rejected",
             Self::Internal { .. } => "internal",
         }
     }
@@ -179,12 +200,28 @@ impl fmt::Display for FfiError {
             Self::ChecksumMismatch { message } => write!(f, "checksum mismatch: {message}"),
             Self::PeerAborted { code } => write!(f, "peer aborted the transfer: {code:?}"),
             Self::Discovery { message } => write!(f, "discovery error: {message}"),
+            Self::Crypto { message } => write!(f, "cryptographic error: {message}"),
+            Self::IdentityMismatch { expected, actual } => write!(
+                f,
+                "identity mismatch: expected {expected}, peer presented {actual}"
+            ),
+            Self::VerificationRejected => {
+                f.write_str("the peer verification was declined or abandoned")
+            }
             Self::Internal { message } => write!(f, "internal error: {message}"),
         }
     }
 }
 
 impl std::error::Error for FfiError {}
+
+impl From<std::io::Error> for FfiError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io {
+            message: error.to_string(),
+        }
+    }
+}
 
 impl From<TransferError> for FfiError {
     fn from(error: TransferError) -> Self {
@@ -220,10 +257,27 @@ impl From<TransferError> for FfiError {
             TransferError::Random => Self::Internal {
                 message: error_message("the system random number generator failed"),
             },
+            TransferError::Crypto(error) => error.into(),
             // `TransferError` is `#[non_exhaustive]`; a future variant must
             // still produce a well-formed error at the boundary.
             _ => Self::Internal {
                 message: error_message("unsupported transfer failure"),
+            },
+        }
+    }
+}
+
+impl From<libcore_crypto::CryptoError> for FfiError {
+    fn from(error: libcore_crypto::CryptoError) -> Self {
+        match error {
+            libcore_crypto::CryptoError::Identity(detail) => Self::Crypto {
+                message: format!("identity key failure: {detail}"),
+            },
+            // A SAS mismatch is only reachable through `confirm_with`; the FFI
+            // currently uses `confirm`, so treat it as a crypto failure rather
+            // than inventing an expected fingerprint that does not exist.
+            other => Self::Crypto {
+                message: other.to_string(),
             },
         }
     }

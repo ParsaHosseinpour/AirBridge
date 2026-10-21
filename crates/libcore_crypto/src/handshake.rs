@@ -52,6 +52,7 @@
 //! protocol bugs, so this one cannot be.
 
 use core::fmt;
+use std::sync::Arc;
 
 use ring::rand::{SecureRandom as _, SystemRandom};
 use ring::{agreement, digest};
@@ -60,6 +61,7 @@ use zeroize::Zeroizing;
 
 use crate::error::{AlertCode, CryptoError};
 use crate::frame::FrameCipher;
+use crate::identity::{fingerprint, Identity, FINGERPRINT_LEN};
 use crate::kdf::KeySchedule;
 use crate::sas::{Sas, SasDigits};
 use crate::wire::{
@@ -74,6 +76,12 @@ const DOMAIN_COMMIT_CLIENT: &[u8] = b"AirBridge UKEY2 v1 client-key-commitment";
 
 /// Domain separator for the responder's key commitment.
 const DOMAIN_COMMIT_SERVER: &[u8] = b"AirBridge UKEY2 v1 server-key-commitment";
+
+/// Domain separator for the initiator's identity signature.
+const DOMAIN_IDENTITY_SIGNATURE_CLIENT: &[u8] = b"AirBridge UKEY2 v1 client-identity-signature";
+
+/// Domain separator for the responder's identity signature.
+const DOMAIN_IDENTITY_SIGNATURE_SERVER: &[u8] = b"AirBridge UKEY2 v1 server-identity-signature";
 
 // ---------------------------------------------------------------------------
 // Ephemeral P-256 key pair
@@ -160,6 +168,95 @@ fn commitments_equal(a: &[u8; COMMITMENT_LEN], b: &[u8; COMMITMENT_LEN]) -> bool
     bool::from(a[..].ct_eq(&b[..]))
 }
 
+/// Builds the message an identity signs inside a `Finished` message.
+///
+/// Every variable-length field is length-prefixed so that no two distinct
+/// tuples can produce the same byte string. The transcript is already the
+/// canonical encoding of every earlier handshake message; including it here
+/// binds the identity to this specific exchange.
+fn identity_signature_input(
+    domain: &[u8],
+    transcript: &[u8],
+    ephemeral_public_key: &[u8],
+    identity_public_key: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        domain.len()
+            + 4
+            + transcript.len()
+            + ephemeral_public_key.len()
+            + identity_public_key.len(),
+    );
+    out.extend_from_slice(domain);
+    out.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    out.extend_from_slice(
+        &u32::try_from(transcript.len())
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
+    );
+    out.extend_from_slice(transcript);
+    out.extend_from_slice(
+        &u16::try_from(ephemeral_public_key.len())
+            .unwrap_or(u16::MAX)
+            .to_be_bytes(),
+    );
+    out.extend_from_slice(ephemeral_public_key);
+    out.extend_from_slice(
+        &u16::try_from(identity_public_key.len())
+            .unwrap_or(u16::MAX)
+            .to_be_bytes(),
+    );
+    out.extend_from_slice(identity_public_key);
+    out
+}
+
+/// Verifies the optional identity fields of a `Finished` message.
+///
+/// Both fields are present or both are absent. A present identity must be a
+/// valid uncompressed P-256 point and must have signed the transcript and both
+/// public keys. The returned key is the peer's stable identity.
+fn verify_peer_identity(
+    identity_public_key: &[u8],
+    identity_signature: &[u8],
+    transcript: &[u8],
+    ephemeral_public_key: &[u8],
+    domain: &[u8],
+) -> Result<Option<Vec<u8>>, CryptoError> {
+    match (
+        identity_public_key.is_empty(),
+        identity_signature.is_empty(),
+    ) {
+        (true, true) => Ok(None),
+        (false, false) => {
+            if identity_public_key.len() != P256_PUBLIC_KEY_LEN
+                || identity_public_key.first() != Some(&0x04)
+            {
+                return Err(CryptoError::Handshake {
+                    code: AlertCode::BadPublicKey,
+                    detail: "identity public key is not an uncompressed P-256 point",
+                });
+            }
+            let input = identity_signature_input(
+                domain,
+                transcript,
+                ephemeral_public_key,
+                identity_public_key,
+            );
+            if !Identity::verify(identity_public_key, &input, identity_signature) {
+                return Err(CryptoError::Handshake {
+                    code: AlertCode::BadPublicKey,
+                    detail: "peer identity signature did not verify",
+                });
+            }
+            Ok(Some(identity_public_key.to_vec()))
+        }
+        _ => Err(CryptoError::Handshake {
+            code: AlertCode::BadPublicKey,
+            detail: "peer sent an incomplete identity",
+        }),
+    }
+}
+
 /// Policy for a [`Responder`]: which next protocols and cipher suites it will
 /// accept.
 ///
@@ -170,6 +267,8 @@ fn commitments_equal(a: &[u8; COMMITMENT_LEN], b: &[u8; COMMITMENT_LEN]) -> bool
 pub struct ResponderConfig {
     accepted_protocols: Vec<String>,
     accepted_suites: Vec<CipherSuite>,
+    identity: Option<Arc<Identity>>,
+    require_peer_identity: bool,
 }
 
 impl ResponderConfig {
@@ -180,7 +279,24 @@ impl ResponderConfig {
         Self {
             accepted_protocols: protocols.iter().map(|p| (*p).to_owned()).collect(),
             accepted_suites: vec![CipherSuite::P256Sha512],
+            identity: None,
+            require_peer_identity: false,
         }
+    }
+
+    /// Presents a long-lived identity and requires one from the initiator.
+    #[must_use]
+    pub fn with_identity(mut self, identity: Arc<Identity>) -> Self {
+        self.identity = Some(identity);
+        self.require_peer_identity = true;
+        self
+    }
+
+    /// Controls whether the initiator must present an identity key.
+    #[must_use]
+    pub const fn require_peer_identity(mut self, required: bool) -> Self {
+        self.require_peer_identity = required;
+        self
     }
 
     /// Replaces the accepted cipher suites.
@@ -208,6 +324,16 @@ impl Default for ResponderConfig {
     }
 }
 
+impl ResponderConfig {
+    fn identity(&self) -> Option<Arc<Identity>> {
+        self.identity.clone()
+    }
+
+    const fn requires_peer_identity(&self) -> bool {
+        self.require_peer_identity
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pending and established sessions
 // ---------------------------------------------------------------------------
@@ -221,11 +347,16 @@ impl Default for ResponderConfig {
 pub struct PendingSession {
     role: Role,
     schedule: KeySchedule,
+    peer_identity: Option<Vec<u8>>,
 }
 
 impl PendingSession {
-    fn new(role: Role, schedule: KeySchedule) -> Self {
-        Self { role, schedule }
+    fn new(role: Role, schedule: KeySchedule, peer_identity: Option<Vec<u8>>) -> Self {
+        Self {
+            role,
+            schedule,
+            peer_identity,
+        }
     }
 
     /// The local role in this handshake.
@@ -238,6 +369,18 @@ impl PendingSession {
     #[must_use]
     pub fn session_id(&self) -> &[u8; 32] {
         &self.schedule.session_id
+    }
+
+    /// The peer's long-term identity public key, when one was presented.
+    #[must_use]
+    pub fn peer_identity_public_key(&self) -> Option<&[u8]> {
+        self.peer_identity.as_deref()
+    }
+
+    /// The peer's stable identity fingerprint, when one was presented.
+    #[must_use]
+    pub fn peer_fingerprint(&self) -> Option<[u8; FINGERPRINT_LEN]> {
+        self.peer_identity.as_deref().map(fingerprint)
     }
 
     /// Derives the Short Authentication String for display.
@@ -294,6 +437,7 @@ impl PendingSession {
             session_id: self.schedule.session_id,
             sas,
             frames,
+            peer_identity: self.peer_identity,
         })
     }
 }
@@ -307,6 +451,7 @@ pub struct EstablishedSession {
     session_id: [u8; 32],
     sas: Sas,
     frames: FrameCipher,
+    peer_identity: Option<Vec<u8>>,
 }
 
 impl EstablishedSession {
@@ -326,6 +471,18 @@ impl EstablishedSession {
     #[must_use]
     pub const fn session_id(&self) -> &[u8; 32] {
         &self.session_id
+    }
+
+    /// The peer's long-term identity public key, when one was presented.
+    #[must_use]
+    pub fn peer_identity_public_key(&self) -> Option<&[u8]> {
+        self.peer_identity.as_deref()
+    }
+
+    /// The peer's stable identity fingerprint, when one was presented.
+    #[must_use]
+    pub fn peer_fingerprint(&self) -> Option<[u8; FINGERPRINT_LEN]> {
+        self.peer_identity.as_deref().map(fingerprint)
     }
 
     /// Encrypts and authenticates a frame.
@@ -391,6 +548,8 @@ pub struct Initiator {
     next_protocol: String,
     key_pair: Option<EphemeralKeyPair>,
     public_key: Vec<u8>,
+    identity: Option<Arc<Identity>>,
+    require_peer_identity: bool,
     random: [u8; NONCE_LEN],
     peer_random: [u8; NONCE_LEN],
     peer_commitment: [u8; COMMITMENT_LEN],
@@ -398,7 +557,11 @@ pub struct Initiator {
 }
 
 impl Initiator {
-    /// Creates an initiator for the given next-protocol identifier.
+    /// Creates an anonymous initiator for the given next-protocol identifier.
+    ///
+    /// Anonymous handshakes authenticate the channel but cannot be bound to a
+    /// persistent peer identity. Production callers should use
+    /// [`Initiator::with_identity`].
     ///
     /// # Errors
     ///
@@ -418,11 +581,39 @@ impl Initiator {
             next_protocol: next_protocol.to_owned(),
             key_pair: Some(key_pair),
             public_key,
+            identity: None,
+            require_peer_identity: false,
             random: [0_u8; NONCE_LEN],
             peer_random: [0_u8; NONCE_LEN],
             peer_commitment: [0_u8; COMMITMENT_LEN],
             transcript: Vec::with_capacity(MAX_MESSAGE_BYTES),
         })
+    }
+
+    /// Creates an initiator that presents a long-lived identity and requires
+    /// one from the responder.
+    ///
+    /// # Errors
+    ///
+    /// As [`Initiator::new`].
+    pub fn with_identity(
+        next_protocol: &str,
+        identity: Arc<Identity>,
+    ) -> Result<Self, CryptoError> {
+        let mut initiator = Self::new(next_protocol)?;
+        initiator.identity = Some(identity);
+        initiator.require_peer_identity = true;
+        Ok(initiator)
+    }
+
+    /// Controls whether the responder must present an identity key.
+    ///
+    /// [`Initiator::with_identity`] enables this automatically. It can be
+    /// disabled only for interoperability with legacy anonymous peers.
+    #[must_use]
+    pub const fn require_peer_identity(mut self, required: bool) -> Self {
+        self.require_peer_identity = required;
+        self
     }
 
     /// Produces `M1`, the `ClientInit` message.
@@ -540,8 +731,22 @@ impl Initiator {
 
     fn client_finished_inner(&mut self) -> Result<Vec<u8>, CryptoError> {
         self.expect_state(InitiatorState::ReceivedServerInit)?;
+        let (identity_public_key, identity_signature) = match &self.identity {
+            Some(identity) => {
+                let input = identity_signature_input(
+                    DOMAIN_IDENTITY_SIGNATURE_CLIENT,
+                    &self.transcript,
+                    &self.public_key,
+                    identity.public_key(),
+                );
+                (identity.public_key().to_vec(), identity.sign(&input)?)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
         let msg = ClientFinished {
             public_key: self.public_key.clone(),
+            identity_public_key,
+            identity_signature,
         };
         let encoded = wire::encode_client_finished(&msg)?;
         self.transcript.extend_from_slice(&encoded);
@@ -574,6 +779,20 @@ impl Initiator {
             });
         }
 
+        let peer_identity = verify_peer_identity(
+            &msg.identity_public_key,
+            &msg.identity_signature,
+            &self.transcript,
+            &msg.public_key,
+            DOMAIN_IDENTITY_SIGNATURE_SERVER,
+        )?;
+        if self.require_peer_identity && peer_identity.is_none() {
+            return Err(CryptoError::Handshake {
+                code: AlertCode::BadPublicKey,
+                detail: "peer did not present a long-term identity",
+            });
+        }
+
         self.transcript.extend_from_slice(message);
 
         let key_pair = self.key_pair.take().ok_or(CryptoError::Handshake {
@@ -584,7 +803,11 @@ impl Initiator {
         let schedule = KeySchedule::derive(&shared[..], &self.transcript)?;
 
         self.state = InitiatorState::Complete;
-        Ok(PendingSession::new(Role::Initiator, schedule))
+        Ok(PendingSession::new(
+            Role::Initiator,
+            schedule,
+            peer_identity,
+        ))
     }
 }
 
@@ -614,6 +837,8 @@ pub struct Responder {
     suite: CipherSuite,
     key_pair: Option<EphemeralKeyPair>,
     public_key: Vec<u8>,
+    identity: Option<Arc<Identity>>,
+    peer_identity: Option<Vec<u8>>,
     random: [u8; NONCE_LEN],
     peer_random: [u8; NONCE_LEN],
     peer_commitment: [u8; COMMITMENT_LEN],
@@ -628,6 +853,7 @@ impl Responder {
     ///
     /// Fails if key generation fails.
     pub fn new(config: ResponderConfig) -> Result<Self, CryptoError> {
+        let identity = config.identity();
         let key_pair = EphemeralKeyPair::generate()?;
         let public_key = key_pair.public_key().to_vec();
         Ok(Self {
@@ -636,6 +862,8 @@ impl Responder {
             suite: CipherSuite::P256Sha512,
             key_pair: Some(key_pair),
             public_key,
+            identity,
+            peer_identity: None,
             random: [0_u8; NONCE_LEN],
             peer_random: [0_u8; NONCE_LEN],
             peer_commitment: [0_u8; COMMITMENT_LEN],
@@ -702,8 +930,22 @@ impl Responder {
             });
         }
 
+        let (identity_public_key, identity_signature) = match &self.identity {
+            Some(identity) => {
+                let input = identity_signature_input(
+                    DOMAIN_IDENTITY_SIGNATURE_SERVER,
+                    &self.transcript,
+                    &self.public_key,
+                    identity.public_key(),
+                );
+                (identity.public_key().to_vec(), identity.sign(&input)?)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
         let msg = ServerFinished {
             public_key: self.public_key.clone(),
+            identity_public_key,
+            identity_signature,
         };
         let encoded = wire::encode_server_finished(&msg)?;
         self.transcript.extend_from_slice(&encoded);
@@ -715,7 +957,10 @@ impl Responder {
         let shared = key_pair.agree(&self.peer_public_key)?;
         let schedule = KeySchedule::derive(&shared[..], &self.transcript)?;
 
-        Ok((encoded, PendingSession::new(Role::Responder, schedule)))
+        Ok((
+            encoded,
+            PendingSession::new(Role::Responder, schedule, self.peer_identity),
+        ))
     }
 
     fn accept_client_init_inner(&mut self, message: &[u8]) -> Result<(), CryptoError> {
@@ -807,6 +1052,21 @@ impl Responder {
             });
         }
 
+        let peer_identity = verify_peer_identity(
+            &msg.identity_public_key,
+            &msg.identity_signature,
+            &self.transcript,
+            &msg.public_key,
+            DOMAIN_IDENTITY_SIGNATURE_CLIENT,
+        )?;
+        if self.config.requires_peer_identity() && peer_identity.is_none() {
+            return Err(CryptoError::Handshake {
+                code: AlertCode::BadPublicKey,
+                detail: "peer did not present a long-term identity",
+            });
+        }
+
+        self.peer_identity = peer_identity;
         self.peer_public_key = msg.public_key;
         self.transcript.extend_from_slice(message);
         self.state = ResponderState::ReceivedClientFinished;

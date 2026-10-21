@@ -45,8 +45,8 @@
 //! ```text
 //! M1  I -> R   ClientInit      version, random_c, suite, SHA-512 commitment to pk_c
 //! M2  R -> I   ServerInit      version, random_s, suite, SHA-512 commitment to pk_s
-//! M3  I -> R   ClientFinished  pk_c          (checked against the M1 commitment)
-//! M4  R -> I   ServerFinished  pk_s          (checked against the M2 commitment)
+//! M3  I -> R   ClientFinished  pk_c, identity_pk_c, signature_c
+//! M4  R -> I   ServerFinished  pk_s, identity_pk_s, signature_s
 //! ```
 //!
 //! Both parties then compute the shared secret `DHS` by P-256 ECDH and derive
@@ -55,6 +55,11 @@
 //! * `AUTH_STRING`, which the SAS is derived from, and
 //! * an independent key block yielding directional AES-256 keys and GCM nonce
 //!   prefixes.
+//!
+//! Each `Finished` signature covers the transcript so far and the signer's
+//! ephemeral public key, and is made by a persistent P-256 identity key. The
+//! peer's identity is therefore bound into the channel and the SAS, allowing
+//! trust to be stored as a SHA-256 fingerprint.
 //!
 //! # Security properties
 //!
@@ -76,9 +81,10 @@
 //!
 //! # Non-goals
 //!
-//! This crate does not authenticate *identities*. It authenticates a *channel*.
-//! Trust in the peer's identity comes from the SAS comparison or from some
-//! external credential, and that decision belongs to the application.
+//! This crate binds an authenticated identity key into a channel, but it does
+//! not decide whether that identity is *trusted*. Trust in the peer comes from
+//! the SAS comparison or from some external credential, and that decision
+//! belongs to the application.
 //!
 //! It is also not a general-purpose crypto library: the primitives are not
 //! re-exported, and the only supported construction is the one the protocol
@@ -116,6 +122,7 @@
 mod error;
 mod frame;
 mod handshake;
+mod identity;
 mod kdf;
 mod sas;
 mod wire;
@@ -123,6 +130,9 @@ mod wire;
 pub use error::{AlertCode, CryptoError};
 pub use frame::{Direction, AEAD_TAG_LEN, FRAME_HEADER_LEN, MAX_FRAME_PAYLOAD};
 pub use handshake::{EstablishedSession, Initiator, PendingSession, Responder, ResponderConfig};
+pub use identity::{
+    fingerprint, fingerprint_hex, parse_fingerprint_hex, Identity, FINGERPRINT_LEN,
+};
 pub use sas::{Sas, SasDigits};
 pub use wire::{CipherSuite, NEXT_PROTOCOL_AEAD};
 

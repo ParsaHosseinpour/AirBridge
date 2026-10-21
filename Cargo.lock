@@ -769,6 +769,7 @@ dependencies = [
 name = "libcore_ffi"
 version = "0.1.0"
 dependencies = [
+ "libcore_crypto",
  "libcore_discovery",
  "libcore_transport",
  "tokio",
@@ -779,6 +780,7 @@ dependencies = [
 name = "libcore_transport"
 version = "0.1.0"
 dependencies = [
+ "libcore_crypto",
  "ring",
  "tokio",
 ]

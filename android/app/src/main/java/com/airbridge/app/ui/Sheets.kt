@@ -41,7 +41,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.airbridge.app.PairingUi
 import com.airbridge.app.R
 import com.airbridge.app.model.NearbyPeer
 import com.airbridge.app.model.SelectedFile
@@ -169,7 +168,7 @@ fun PeerSheet(
                     )
                     Spacer(Modifier.width(6.dp))
                     Text(
-                        text = "Not verified — you will confirm a PIN before sending",
+                        text = "Not verified — you will compare a code before sending",
                         color = Amber,
                         fontSize = 11.5.sp,
                     )
@@ -187,7 +186,7 @@ fun PeerSheet(
                 )
                 Spacer(Modifier.height(10.dp))
                 SecondaryActionButton(
-                    text = "Verify with PIN",
+                    text = "Verify device",
                     iconRes = R.drawable.ic_lock,
                     onClick = onVerify,
                     modifier = Modifier.fillMaxWidth(),
@@ -229,13 +228,15 @@ fun PeerSheet(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun PairingSheet(
-    pairing: PairingUi,
+fun VerificationSheet(
+    peerName: String,
+    code: String,
+    busy: Boolean,
     onApprove: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     ModalBottomSheet(
-        onDismissRequest = { if (!pairing.approving) onDismiss() },
+        onDismissRequest = { if (!busy) onDismiss() },
         containerColor = SurfaceGlass,
         contentColor = TextPrimary,
         scrimColor = Color.Black.copy(alpha = 0.7f),
@@ -268,7 +269,7 @@ fun PairingSheet(
 
             Spacer(Modifier.height(16.dp))
             Text(
-                text = "Verify with ${pairing.peer.name}",
+                text = "Verify with $peerName",
                 color = TextPrimary,
                 fontSize = 19.sp,
                 fontWeight = FontWeight.SemiBold,
@@ -284,54 +285,18 @@ fun PairingSheet(
             )
 
             Spacer(Modifier.height(20.dp))
-            Row(
-                horizontalArrangement = Arrangement.Center,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                pairing.code.chunked(3).forEachIndexed { groupIndex, group ->
-                    group.forEach { digit ->
-                        CodeBox(digit.toString())
-                        Spacer(Modifier.width(4.dp))
-                    }
-                    if (groupIndex == 0) {
-                        Spacer(Modifier.width(8.dp))
-                    }
-                }
-            }
+            SasCode(code)
 
             Spacer(Modifier.height(16.dp))
             Text(
-                text = "Never share this code with anyone else.",
+                text = "The code is derived from both device keys over the encrypted connection.",
                 color = TextMuted.copy(alpha = 0.8f),
                 fontSize = 11.sp,
                 textAlign = TextAlign.Center,
             )
 
-            Spacer(Modifier.height(10.dp))
-            Row(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(Amber.copy(alpha = 0.10f))
-                    .border(1.dp, Amber.copy(alpha = 0.28f), RoundedCornerShape(12.dp))
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Icon(
-                    painter = painterResource(R.drawable.ic_warning),
-                    contentDescription = null,
-                    tint = Amber,
-                    modifier = Modifier.size(13.dp),
-                )
-                Spacer(Modifier.width(7.dp))
-                Text(
-                    text = "Preview pairing: this PIN is generated on this device. The Rust SAS handshake is not wired up yet.",
-                    color = Amber,
-                    fontSize = 10.5.sp,
-                )
-            }
-
             Spacer(Modifier.height(18.dp))
-            if (pairing.approving) {
+            if (busy) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.Center,
@@ -360,12 +325,32 @@ fun PairingSheet(
             }
 
             Spacer(Modifier.height(8.dp))
-            TextButton(onClick = onDismiss, enabled = !pairing.approving) {
+            TextButton(onClick = onDismiss, enabled = !busy) {
                 Text(
                     text = "Cancel",
                     color = TextMuted,
                     fontSize = 13.sp,
                 )
+            }
+        }
+    }
+}
+
+/** Renders a six-digit SAS as grouped code boxes. */
+@Composable
+fun SasCode(code: String, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        code.filter(Char::isDigit).chunked(3).forEachIndexed { groupIndex, group ->
+            group.forEach { digit ->
+                CodeBox(digit.toString())
+                Spacer(Modifier.width(4.dp))
+            }
+            if (groupIndex == 0) {
+                Spacer(Modifier.width(8.dp))
             }
         }
     }

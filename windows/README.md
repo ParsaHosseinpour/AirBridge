@@ -13,17 +13,17 @@ windows/
     Themes/AirBridgeTheme.xaml          palette, cards, buttons, converters
     Controls/PeerRadarView.xaml         interactive radar and drop target
     Controls/RadarPanel.cs              orbit layout for peer bubbles
-    Dialogs/SasVerificationDialog.xaml  six-digit PIN confirmation
+    Dialogs/SasVerificationDialog.xaml  SAS and key-fingerprint confirmation
     Dialogs/SettingsDialog.xaml         device, port, folder, discovery settings
     Models/                             peer, staged-file and transfer view models
     Services/
       NativeCore.cs                     safe native-library discovery and loading
       DiscoveryService.cs               PeerDiscoveryEngine lifecycle and events
       WindowsBleBackend.cs              WinRT BLE advertiser/scanner
-      TransferCoordinator.cs            serial send queue and receive loop
-      SasService.cs                     pairing seam and preview implementation
+      TransferCoordinator.cs            serial send queue and secure receive loop
+      SasService.cs                     compare-the-code prompt model
       FirewallService.cs                firewall rule status and elevated setup
-      SettingsStore.cs                  JSON settings in %LOCALAPPDATA%
+      SettingsStore.cs                  settings and identity in %LOCALAPPDATA%
     ViewModels/MainViewModel.cs         UI state and orchestration
   scripts/Setup-Firewall.ps1            elevated netsh advfirewall setup
   scripts/README-Firewall.txt           firewall usage notes
@@ -92,9 +92,12 @@ installer or MSIX registration is needed.
 * **Send** accepts files dropped anywhere on the radar, dropped on the window,
   or chosen with the file picker. Files are staged locally; **Clear** removes
   them.
-* **Verify pairing** opens the six-digit PIN dialog. The PIN must match the
-  other device before the send starts. See
-  [Preview pairing](#preview-pairing) below.
+* **Verify pairing** opens the security-code dialog. Both devices show the
+  same six-digit code from the P-256 handshake; approving it binds the other
+  device's key fingerprint to its peer id. An already trusted device also has
+  **Verify device again**, which re-runs the handshake and replaces the pinned
+  fingerprint if the other side legitimately rotated its key. See
+  [Secure pairing](#secure-pairing) below.
 * **Transfers** shows one circular progress ring per file. Pause, resume,
   cancel, dismiss, and *Show in folder* are available as the transfer allows.
 * **Sharing** turns the inbound listener on or off and shows the transfer port
@@ -108,6 +111,7 @@ installer or MSIX registration is needed.
 | Item | Path |
 | --- | --- |
 | Settings | `%LOCALAPPDATA%\AirBridge\settings.json` |
+| Device identity | `%LOCALAPPDATA%\AirBridge\identity.pkcs8` |
 | Logs | `%LOCALAPPDATA%\AirBridge\logs\airbridge-YYYYMMDD.log` |
 | Received files | `%USERPROFILE%\Downloads\AirBridge` by default |
 
@@ -122,7 +126,7 @@ buttons on the Sharing card open both folders in File Explorer.
 
 | Setting | Default |
 | --- | --- |
-| peer id | stable 16-byte id generated on first scan |
+| peer id | stable 16-byte id generated when settings are first created |
 | display name | `<user>'s PC`, editable |
 | listen port | `42517` |
 | BLE | enabled |
@@ -156,6 +160,28 @@ discovery and keep listening as long as **Accept incoming files** is on.
   scanners, HTTP probes) are ignored instead of being shown as failed
   transfers.
 
+### Secure pairing
+
+Every transfer starts with a P-256 key-exchange handshake, before the file
+protocol speaks. Each device signs the transcript with a long-lived P-256
+identity key; HKDF then derives independent AES-256-GCM keys for each
+direction. The six-digit code on both screens is the SAS derived from that
+transcript, so a man-in-the-middle cannot make the two codes match.
+
+Trust is keyed by the SHA-256 fingerprint of the peer's identity key, not by
+the advertised peer id alone. Approving the code stores that fingerprint and
+binds the authenticated peer id to it; later transfers pin the key and
+auto-confirm only when the fingerprint is already trusted. Legacy
+`trustedPeers` entries from older builds are ignored because an unauthenticated
+id proves nothing.
+
+Explicit pairing uses the same handshake over the transfer port, with a
+pairing-only preamble. The receiver reports a verified device without
+offering or saving an empty file, then re-arms its listener. Incoming
+connections that cannot complete the handshake or present an unusable frame
+(port scanners, HTTP probes) are ignored instead of being shown as failed
+transfers.
+
 ### Firewall
 
 Windows Firewall drops unsolicited inbound traffic by default. The app checks
@@ -175,20 +201,6 @@ powershell -ExecutionPolicy Bypass -File windows/scripts/Setup-Firewall.ps1 -Rem
 ```
 
 ## Known limitations
-
-### Preview pairing
-
-`libcore_ffi` currently exports discovery and transport sessions but **not**
-the cryptographic handshake. The Windows app uses `LocalPreviewSasGateway`, the
-same seam as the Android frontend:
-
-* the six-digit PIN is generated locally and expires after two minutes;
-* it does **not** authenticate the remote device;
-* approving it does **not** persist trust.
-
-The dialog labels this clearly as **Preview pairing**. When the handshake is
-exported, replace `ISasGateway` in `Services/SasService.cs` and remove the
-preview disclosure.
 
 ### Incoming file names
 
@@ -237,9 +249,10 @@ For diagnostics, open **Logs** in the Sharing card. Logs are also written under
 
 ## Security notes
 
-AirBridge is local-first: no cloud service, no account, and no uploads. The
-transport is designed around an authenticated, resumable channel; the current
-Windows frontend's pairing step is a preview (see above), so do not treat the
-PIN as proof of identity in this build. Firewall rules are limited to private
-and domain networks, and the transfer rule is bound to the app executable when
-possible.
+AirBridge is local-first: no cloud service, no account, and no uploads. Every
+transfer uses an authenticated P-256 handshake followed by directional
+AES-256-GCM frames, and trust is bound to the peer's identity-key fingerprint
+after the user compares the SAS. Firewall rules are limited to private and
+domain networks, and the transfer rule is bound to the app executable when
+possible. The identity private key stays in
+`%LOCALAPPDATA%\AirBridge\identity.pkcs8` and is never sent to another device.

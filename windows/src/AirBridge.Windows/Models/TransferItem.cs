@@ -9,6 +9,7 @@ public enum TransferPhase
 {
     Queued,
     Connecting,
+    Verifying,
     Running,
     Pausing,
     Paused,
@@ -36,6 +37,11 @@ public sealed class TransferItem : ObservableObject
     private ulong? _payloadId;
     private string? _error;
     private string _fileName;
+    private string _peerName;
+    private string _peerIdHex;
+    private string? _peerFingerprint;
+    private string? _sas;
+    private bool _pairingOnly;
     private string? _destinationPath;
     private double _smoothedRate;
     private long _lastSampleTimestamp;
@@ -53,21 +59,73 @@ public sealed class TransferItem : ObservableObject
         Direction = direction;
         _fileName = fileName;
         SourcePath = sourcePath;
-        PeerName = string.IsNullOrWhiteSpace(peerName) ? "Nearby device" : peerName;
-        PeerIdHex = peerIdHex;
+        _peerName = string.IsNullOrWhiteSpace(peerName) ? "Nearby device" : peerName;
+        _peerIdHex = peerIdHex ?? string.Empty;
         Address = address;
     }
 
     public Guid Id { get; } = Guid.NewGuid();
     public TransferDirection Direction { get; }
     public string SourcePath { get; }
-    public string PeerName { get; }
-    public string PeerIdHex { get; }
     public string Address { get; }
 
     internal FileTransferSession? Session { get; set; }
     internal bool PauseRequested { get; set; }
     internal bool CancelRequested { get; set; }
+
+    public string PeerName
+    {
+        get => _peerName;
+        private set
+        {
+            if (SetProperty(ref _peerName, value))
+            {
+                OnPropertiesChanged(nameof(StatusText), nameof(Header), nameof(AutomationName));
+            }
+        }
+    }
+
+    /// <summary>Peer id claimed after the authenticated handshake.</summary>
+    public string PeerIdHex
+    {
+        get => _peerIdHex;
+        private set => SetProperty(ref _peerIdHex, value ?? string.Empty);
+    }
+
+    /// <summary>SHA-256 fingerprint of the peer's identity key.</summary>
+    public string? PeerFingerprint
+    {
+        get => _peerFingerprint;
+        private set => SetProperty(ref _peerFingerprint, value);
+    }
+
+    /// <summary>Short authentication string shown while the user compares codes.</summary>
+    public string? Sas
+    {
+        get => _sas;
+        private set => SetProperty(ref _sas, value);
+    }
+
+    /// <summary>True when this connection verified a device without moving a file.</summary>
+    public bool PairingOnly
+    {
+        get => _pairingOnly;
+        private set
+        {
+            if (SetProperty(ref _pairingOnly, value))
+            {
+                OnPropertiesChanged(
+                    nameof(FileName),
+                    nameof(StatusText),
+                    nameof(SizeText),
+                    nameof(PercentText),
+                    nameof(DirectionGlyph),
+                    nameof(StatusGlyph),
+                    nameof(Header),
+                    nameof(AutomationName));
+            }
+        }
+    }
 
     public string FileName
     {
@@ -179,8 +237,8 @@ public sealed class TransferItem : ObservableObject
     public bool CanPause => Direction == TransferDirection.Send &&
                             Phase is TransferPhase.Connecting or TransferPhase.Running;
     public bool CanResume => Direction == TransferDirection.Send && Phase == TransferPhase.Paused;
-    public bool CanCancel => Phase is TransferPhase.Queued or TransferPhase.Connecting or TransferPhase.Running
-        or TransferPhase.Pausing or TransferPhase.Paused;
+    public bool CanCancel => Phase is TransferPhase.Queued or TransferPhase.Connecting or TransferPhase.Verifying
+        or TransferPhase.Running or TransferPhase.Pausing or TransferPhase.Paused;
     public bool CanDismiss => IsTerminal;
 
     public double Progress
@@ -202,36 +260,42 @@ public sealed class TransferItem : ObservableObject
     }
 
     public bool RingIsIndeterminate =>
-        Phase is TransferPhase.Connecting or TransferPhase.Pausing or TransferPhase.Cancelling ||
+        Phase is TransferPhase.Connecting or TransferPhase.Verifying or TransferPhase.Pausing or TransferPhase.Cancelling ||
         (Phase is TransferPhase.Queued && TotalBytes is null) ||
         (Phase == TransferPhase.Running && TotalBytes is null);
 
     public string PercentText => Phase switch
     {
-        TransferPhase.Completed => "100%",
+        TransferPhase.Completed => PairingOnly ? "✓" : "100%",
         TransferPhase.Queued => "Queued",
         TransferPhase.Connecting => "…",
+        TransferPhase.Verifying => "…",
         TransferPhase.Paused => $"{Progress:0}%",
         TransferPhase.Failed => "!",
         TransferPhase.Cancelled => "—",
         _ => TotalBytes is > 0 ? $"{Progress:0}%" : "…",
     };
 
-    public string SizeText => TotalBytes is { } total
-        ? $"{Format.Bytes(BytesTransferred)} of {Format.Bytes(total)}"
-        : Format.Bytes(BytesTransferred);
+    public string SizeText => PairingOnly
+        ? "Identity verified"
+        : TotalBytes is { } total
+            ? $"{Format.Bytes(BytesTransferred)} of {Format.Bytes(total)}"
+            : Format.Bytes(BytesTransferred);
 
     public string StatusText => Phase switch
     {
         TransferPhase.Queued => "Waiting to start",
         TransferPhase.Connecting => Direction == TransferDirection.Send ? "Connecting to device…" : "Waiting for sender…",
+        TransferPhase.Verifying => "Compare the security code",
         TransferPhase.Running => TotalBytes is null
             ? (Direction == TransferDirection.Send ? "Sending…" : "Receiving…")
             : $"{Verb} · {Format.Rate(_smoothedRate)}",
         TransferPhase.Pausing => "Pausing…",
         TransferPhase.Paused => $"Paused · {Format.Bytes(BytesTransferred)} saved",
         TransferPhase.Cancelling => "Cancelling…",
-        TransferPhase.Completed => Direction == TransferDirection.Send ? "Sent successfully" : "Received and verified",
+        TransferPhase.Completed => PairingOnly
+            ? "Device verified"
+            : Direction == TransferDirection.Send ? "Sent successfully" : "Received and verified",
         TransferPhase.Failed => Error ?? "Transfer failed",
         TransferPhase.Cancelled => "Cancelled",
         _ => string.Empty,
@@ -241,11 +305,12 @@ public sealed class TransferItem : ObservableObject
 
     public string DirectionLabel => Direction == TransferDirection.Send ? "Sending" : "Receiving";
 
-    public string DirectionGlyph => Direction == TransferDirection.Send ? "\uE898" : "\uE896";
+    public string DirectionGlyph => PairingOnly ? "\uE72E" : Direction == TransferDirection.Send ? "\uE898" : "\uE896";
 
     public string StatusGlyph => Phase switch
     {
-        TransferPhase.Completed => "\uE73E",
+        TransferPhase.Completed => PairingOnly ? "\uE72E" : "\uE73E",
+        TransferPhase.Verifying => "\uE72E",
         TransferPhase.Failed => "\uE783",
         TransferPhase.Cancelled => "\uE711",
         TransferPhase.Paused => "\uE769",
@@ -258,6 +323,7 @@ public sealed class TransferItem : ObservableObject
     public string ProgressColor => Phase switch
     {
         TransferPhase.Completed => "#FF6EE7C8",
+        TransferPhase.Verifying => "#FFFFCF70",
         TransferPhase.Failed => "#FFFF6B7A",
         TransferPhase.Paused => "#FFFFCF70",
         _ => "#FF5AC8FA",
@@ -280,9 +346,33 @@ public sealed class TransferItem : ObservableObject
     public string AutomationName =>
         $"{DirectionLabel} {FileName} {(TotalBytes is null ? string.Empty : $"to {PeerName}")}, {StatusText}";
 
-    public string Header => Direction == TransferDirection.Send ? $"To {PeerName}" : "Incoming";
+    public string Header => PairingOnly
+        ? "Device verification"
+        : Direction == TransferDirection.Send ? $"To {PeerName}" : "Incoming";
 
     public void SetPayload(ulong? payloadId) => PayloadId = payloadId;
+
+    /// <summary>Updates the authenticated identity of the remote device.</summary>
+    public void ApplyPeerIdentity(string peerId, string? fingerprint)
+    {
+        if (!string.IsNullOrWhiteSpace(peerId))
+        {
+            PeerIdHex = peerId;
+        }
+
+        if (!string.IsNullOrWhiteSpace(fingerprint))
+        {
+            PeerFingerprint = fingerprint.ToLowerInvariant();
+        }
+    }
+
+    public void UpdatePeerName(string? name)
+    {
+        if (!string.IsNullOrWhiteSpace(name))
+        {
+            PeerName = name;
+        }
+    }
 
     public void MarkConnecting()
     {
@@ -295,10 +385,29 @@ public sealed class TransferItem : ObservableObject
         }
     }
 
+    /// <summary>The handshake completed and the user must compare the SAS.</summary>
+    public void MarkVerifying(string sas, string fingerprint)
+    {
+        if (IsTerminal)
+        {
+            return;
+        }
+
+        Sas = sas;
+        if (!string.IsNullOrWhiteSpace(fingerprint))
+        {
+            PeerFingerprint = fingerprint.ToLowerInvariant();
+        }
+
+        Error = null;
+        Phase = TransferPhase.Verifying;
+    }
+
     public void MarkRunning()
     {
-        if (Phase is TransferPhase.Queued or TransferPhase.Connecting or TransferPhase.Paused)
+        if (Phase is TransferPhase.Queued or TransferPhase.Connecting or TransferPhase.Verifying or TransferPhase.Paused)
         {
+            Sas = null;
             Phase = TransferPhase.Running;
             RaiseLiveMetrics();
         }
@@ -330,23 +439,42 @@ public sealed class TransferItem : ObservableObject
     public void MarkCancelled()
     {
         CancelRequested = false;
+        Sas = null;
         Phase = TransferPhase.Cancelled;
     }
 
     public void MarkFailed(string message)
     {
+        Sas = null;
         Error = message;
         Phase = TransferPhase.Failed;
     }
 
     public void MarkCompleted(TransferReport report)
     {
+        ApplyPeerIdentity(report.PeerId ?? string.Empty, report.PeerFingerprint);
+        PairingOnly = report.PairingOnly;
+        Sas = null;
+        Error = null;
+
+        if (report.PairingOnly)
+        {
+            FileName = "Device verification";
+            PayloadId = null;
+            TotalBytes = null;
+            BytesTransferred = 0;
+            DestinationPath = null;
+            _smoothedRate = 0;
+            Phase = TransferPhase.Completed;
+            RaiseLiveMetrics();
+            return;
+        }
+
         PayloadId = report.PayloadId;
         TotalBytes = report.TotalBytes;
         BytesTransferred = report.TotalBytes;
         _smoothedRate = 0;
         DestinationPath = report.DestinationPath;
-        Error = null;
         Phase = TransferPhase.Completed;
         RaiseLiveMetrics();
     }

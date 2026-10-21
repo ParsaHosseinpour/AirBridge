@@ -37,12 +37,18 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use libcore_crypto::{fingerprint_hex, Identity};
 use libcore_transport as core;
+use libcore_transport::{PendingConnection, SecureStream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex};
 
 use crate::cancel::{Canceller, WaitCancelled};
+use crate::crypto::{
+    exchange_peer_ids, parse_fingerprint, read_mode, validate_peer_id, write_mode, MODE_PAIRING,
+    MODE_TRANSFER,
+};
 use crate::error::FfiError;
 use crate::runtime;
 
@@ -77,6 +83,8 @@ pub enum TransferStatus {
     Idle,
     /// Connecting to the peer, or (for a receive) binding and accepting.
     Connecting,
+    /// The encrypted handshake completed and the user is confirming the code.
+    Verifying,
     /// Bytes are moving.
     Running,
     /// The payload was verified and committed (receive) or acknowledged
@@ -98,14 +106,21 @@ pub struct TransferReport {
     /// Byte offset the transfer started from: zero on a fresh payload, the
     /// receiver's verified prefix on a resumed one.
     pub resumed_from: u64,
-    /// Bytes counted by the stream adapter, framing included. Within a few
-    /// bytes per chunk of `total_bytes` on a clean transfer; larger when the
+    /// Payload bytes moved through the encrypted stream adapter. This equals
+    /// `total_bytes - resumed_from` on a clean transfer and is larger when the
     /// receiver requested repairs.
     pub bytes_on_wire: u64,
     /// Chunks written to the socket (sends only), retransmissions included.
     pub chunks_sent: Option<u64>,
     /// Where the payload was committed (receives only).
     pub destination_path: Option<String>,
+    /// Peer id claimed *after* the authenticated handshake.
+    pub peer_id: Option<String>,
+    /// SHA-256 fingerprint of the peer's long-lived identity key.
+    pub peer_fingerprint: Option<String>,
+    /// True when this connection performed a pairing-only exchange; no file
+    /// was moved and `destination_path` is `None`.
+    pub pairing_only: bool,
 }
 
 /// Events emitted by a running session.
@@ -118,8 +133,28 @@ pub enum TransferEvent {
         /// `None`; the completed [`TransferReport`] carries the final size.
         total_bytes: Option<u64>,
     },
-    /// Throttled progress sample. `bytes_transferred` is bytes counted by the
-    /// adapter (framing included), not a percentage.
+    /// The handshake completed and the peer's identity is waiting for a
+    /// decision. Compare `sas` with the other screen, then call
+    /// [`FileTransferSession::confirm_peer`] or
+    /// [`FileTransferSession::reject_peer`].
+    VerificationRequired {
+        /// Six-digit Short Authentication String, derived from the handshake
+        /// transcript that includes both identity keys.
+        sas: String,
+        /// SHA-256 fingerprint of the peer's identity key.
+        peer_fingerprint: String,
+        /// The peer's uncompressed P-256 public key, for diagnostics.
+        peer_public_key: Vec<u8>,
+    },
+    /// The peer was authenticated and its peer id was bound to the fingerprint.
+    PeerVerified {
+        /// Claimed peer id, received only after the handshake.
+        peer_id: String,
+        /// Fingerprint the id is bound to.
+        peer_fingerprint: String,
+    },
+    /// Throttled progress sample. `bytes_transferred` is plaintext payload
+    /// counted by the adapter, not a percentage.
     Progress {
         /// Bytes moved so far.
         bytes_transferred: u64,
@@ -151,7 +186,7 @@ pub enum TransferEvent {
 }
 
 /// Tunables for an upload.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct SendOptions {
     /// Payload id to use. `None` generates one at construction (read it back
     /// with [`FileTransferSession::payload_id`] so it can be sent to the peer
@@ -171,10 +206,33 @@ pub struct SendOptions {
     /// Minimum interval between progress events.
     #[uniffi(default = 100)]
     pub progress_interval_ms: u64,
+    /// This device's long-lived identity, as PKCS#8 DER. Generate it once
+    /// with [`crate::PeerIdentity::generate`] and persist it privately.
+    pub identity_pkcs8: Vec<u8>,
+    /// This device's discovery peer id. It is exchanged only after the
+    /// authenticated handshake.
+    #[uniffi(default = "")]
+    pub local_peer_id: String,
+    /// Fingerprints previously verified by the user. A peer whose fingerprint
+    /// is in this list is confirmed automatically, without a prompt.
+    pub trusted_peer_fingerprints: Vec<String>,
+    /// When set, the peer must present exactly this fingerprint. Use it to pin
+    /// a device across retries; any other identity fails with
+    /// [`FfiError::IdentityMismatch`].
+    #[uniffi(default)]
+    pub expected_peer_fingerprint: Option<String>,
+    /// Deadline for the four-message handshake and the identity preamble.
+    #[uniffi(default = 30000)]
+    pub handshake_timeout_ms: u64,
+    /// How long an interactive verification may wait for
+    /// [`FileTransferSession::confirm_peer`] or
+    /// [`FileTransferSession::reject_peer`].
+    #[uniffi(default = 120000)]
+    pub verification_timeout_ms: u64,
 }
 
 impl SendOptions {
-    fn validate(&self) -> Result<(), FfiError> {
+    fn security(&self) -> Result<SecurityConfig, FfiError> {
         core::ChunkPlan::new(self.chunk_size).map_err(FfiError::from)?;
         if self.response_timeout_ms == 0 {
             return Err(FfiError::invalid_argument(
@@ -186,12 +244,19 @@ impl SendOptions {
                 "progress_interval_ms must be non-zero",
             ));
         }
-        Ok(())
+        SecurityConfig::parse(
+            &self.identity_pkcs8,
+            &self.local_peer_id,
+            self.trusted_peer_fingerprints.as_slice(),
+            self.expected_peer_fingerprint.as_deref(),
+            self.handshake_timeout_ms,
+            self.verification_timeout_ms,
+        )
     }
 }
 
 /// Tunables for a download.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct ReceiveOptions {
     /// Reject a `HELLO` for any other payload id. Set this when the app knows
     /// which transfer it expects; `None` accepts whatever arrives first.
@@ -209,10 +274,29 @@ pub struct ReceiveOptions {
     /// Minimum interval between progress events.
     #[uniffi(default = 100)]
     pub progress_interval_ms: u64,
+    /// This device's long-lived identity, as PKCS#8 DER.
+    pub identity_pkcs8: Vec<u8>,
+    /// This device's discovery peer id, exchanged after the handshake.
+    #[uniffi(default = "")]
+    pub local_peer_id: String,
+    /// Fingerprints previously verified by the user. Matching peers are
+    /// confirmed automatically.
+    pub trusted_peer_fingerprints: Vec<String>,
+    /// When set, only this peer identity is accepted.
+    #[uniffi(default)]
+    pub expected_peer_fingerprint: Option<String>,
+    /// Deadline for the four-message handshake and the identity preamble.
+    #[uniffi(default = 30000)]
+    pub handshake_timeout_ms: u64,
+    /// How long an interactive verification may wait for
+    /// [`FileTransferSession::confirm_peer`] or
+    /// [`FileTransferSession::reject_peer`].
+    #[uniffi(default = 120000)]
+    pub verification_timeout_ms: u64,
 }
 
 impl ReceiveOptions {
-    fn validate(&self) -> Result<(), FfiError> {
+    fn security(&self) -> Result<SecurityConfig, FfiError> {
         if self.ack_every_bytes == 0 {
             return Err(FfiError::invalid_argument(
                 "ack_every_bytes must be non-zero",
@@ -228,12 +312,91 @@ impl ReceiveOptions {
                 "progress_interval_ms must be non-zero",
             ));
         }
-        Ok(())
+        SecurityConfig::parse(
+            &self.identity_pkcs8,
+            &self.local_peer_id,
+            self.trusted_peer_fingerprints.as_slice(),
+            self.expected_peer_fingerprint.as_deref(),
+            self.handshake_timeout_ms,
+            self.verification_timeout_ms,
+        )
     }
 }
 
+/// Validated identity, trust and deadline configuration.
+struct SecurityConfig {
+    identity: Arc<Identity>,
+    local_peer_id: String,
+    expected_peer_fingerprint: Option<[u8; 32]>,
+    trusted_peer_fingerprints: Vec<[u8; 32]>,
+    handshake_timeout: Duration,
+    verification_timeout: Duration,
+}
+
+impl SecurityConfig {
+    fn parse(
+        identity_pkcs8: &[u8],
+        local_peer_id: &str,
+        trusted: &[String],
+        expected: Option<&str>,
+        handshake_timeout_ms: u64,
+        verification_timeout_ms: u64,
+    ) -> Result<Self, FfiError> {
+        if identity_pkcs8.is_empty() {
+            return Err(FfiError::invalid_argument(
+                "identity_pkcs8 must contain a persisted PeerIdentity key",
+            ));
+        }
+        let identity = Identity::from_pkcs8(identity_pkcs8).map_err(|error| {
+            FfiError::invalid_argument(format!("identity_pkcs8 is not a valid key: {error}"))
+        })?;
+        validate_peer_id(local_peer_id)?;
+        if handshake_timeout_ms == 0 {
+            return Err(FfiError::invalid_argument(
+                "handshake_timeout_ms must be non-zero",
+            ));
+        }
+        if verification_timeout_ms == 0 {
+            return Err(FfiError::invalid_argument(
+                "verification_timeout_ms must be non-zero",
+            ));
+        }
+
+        let expected_peer_fingerprint = expected
+            .map(|value| parse_fingerprint(value, "expected_peer_fingerprint"))
+            .transpose()?;
+        let mut parsed_trusted = Vec::with_capacity(trusted.len());
+        for (index, value) in trusted.iter().enumerate() {
+            parsed_trusted.push(parse_fingerprint(
+                value,
+                &format!("trusted_peer_fingerprints[{index}]"),
+            )?);
+        }
+
+        Ok(Self {
+            identity: Arc::new(identity),
+            local_peer_id: local_peer_id.to_owned(),
+            expected_peer_fingerprint,
+            trusted_peer_fingerprints: parsed_trusted,
+            handshake_timeout: Duration::from_millis(handshake_timeout_ms),
+            verification_timeout: Duration::from_millis(verification_timeout_ms),
+        })
+    }
+
+    fn trusts(&self, fingerprint: &[u8; 32]) -> bool {
+        self.trusted_peer_fingerprints.contains(fingerprint)
+    }
+}
+
+/// An explicit answer to [`TransferEvent::VerificationRequired`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerDecision {
+    Confirm,
+    Reject,
+}
+
 /// How the session was configured.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Mode {
     Send(SendOptions),
     Receive(ReceiveOptions),
@@ -245,6 +408,8 @@ struct SessionState {
     status: TransferStatus,
     report: Option<TransferReport>,
     payload_id: Option<u64>,
+    peer_id: Option<String>,
+    peer_fingerprint: Option<String>,
 }
 
 /// The state every exported method shares.
@@ -255,6 +420,7 @@ struct SessionInner {
     /// Source file (send) or destination file (receive).
     path: String,
     mode: Mode,
+    security: SecurityConfig,
     canceller: Arc<Canceller>,
     state: Mutex<SessionState>,
     /// The event sender; taken and dropped when the session reaches a
@@ -262,6 +428,8 @@ struct SessionInner {
     /// been buffered.
     events: Mutex<Option<broadcast::Sender<TransferEvent>>>,
     receiver: Arc<AsyncMutex<Option<broadcast::Receiver<TransferEvent>>>>,
+    /// Receives the user's answer to a pending SAS prompt.
+    decision: Mutex<Option<oneshot::Sender<PeerDecision>>>,
     started: AtomicBool,
 }
 
@@ -304,8 +472,8 @@ impl SessionInner {
         self.set_status(TransferStatus::Connecting);
 
         let result = match &self.mode {
-            Mode::Send(options) => self.upload(*options).await,
-            Mode::Receive(options) => self.receive(*options).await,
+            Mode::Send(options) => self.upload(options.clone()).await,
+            Mode::Receive(options) => self.receive(options.clone()).await,
         };
 
         match result {
@@ -336,7 +504,7 @@ impl SessionInner {
         }
     }
 
-    /// Connects, streams the file and waits for the receiver's `COMPLETE`.
+    /// Connects, authenticates, streams the file and waits for `COMPLETE`.
     async fn upload(&self, options: SendOptions) -> Result<TransferReport, FfiError> {
         let total = tokio::fs::metadata(&self.path)
             .await
@@ -346,6 +514,10 @@ impl SessionInner {
         let stream = self.connect().await?;
         // Nagle would only add latency to the small control frames.
         let _ = stream.set_nodelay(true);
+
+        let (stream, _mode) = self.establish(stream, true).await?;
+        let peer_id = self.peer_id();
+        let peer_fingerprint = self.peer_fingerprint();
 
         let payload_id = lock(&self.state)
             .payload_id
@@ -383,6 +555,9 @@ impl SessionInner {
                 bytes_on_wire: counter.load(Ordering::Relaxed),
                 chunks_sent: Some(report.chunks_sent),
                 destination_path: None,
+                peer_id,
+                peer_fingerprint,
+                pairing_only: false,
             }),
             Err(error) => Err(cancel_or(error, &self.canceller)),
         }
@@ -413,6 +588,26 @@ impl SessionInner {
             () = WaitCancelled(self.canceller.as_ref()) => return Err(FfiError::Cancelled),
         };
         let _ = stream.set_nodelay(true);
+
+        let (stream, mode) = self.establish(stream, false).await?;
+        let peer_id = self.peer_id();
+        let peer_fingerprint = self.peer_fingerprint();
+
+        if mode == MODE_PAIRING {
+            // A pairing connection carries no payload. Completing normally
+            // lets a long-lived receiver re-arm without showing an offer.
+            return Ok(TransferReport {
+                payload_id: 0,
+                total_bytes: 0,
+                resumed_from: 0,
+                bytes_on_wire: 0,
+                chunks_sent: None,
+                destination_path: None,
+                peer_id,
+                peer_fingerprint,
+                pairing_only: true,
+            });
+        }
 
         let counter = Arc::new(AtomicU64::new(0));
         self.set_status(TransferStatus::Running);
@@ -448,10 +643,190 @@ impl SessionInner {
                     bytes_on_wire: counter.load(Ordering::Relaxed),
                     chunks_sent: None,
                     destination_path: Some(report.path.to_string_lossy().into_owned()),
+                    peer_id,
+                    peer_fingerprint,
+                    pairing_only: false,
                 })
             }
             Err(error) => Err(cancel_or(error, &self.canceller)),
         }
+    }
+
+    /// Runs the handshake, applies the identity policy and exchanges the
+    /// authenticated peer id plus the application mode.
+    async fn establish(
+        &self,
+        stream: TcpStream,
+        initiator: bool,
+    ) -> Result<(SecureStream<TcpStream>, u8), FfiError> {
+        let timeout = self.security.handshake_timeout;
+        let identity = Arc::clone(&self.security.identity);
+        let handshake = async move {
+            if initiator {
+                core::initiate(stream, identity, timeout).await
+            } else {
+                core::respond(stream, identity, timeout).await
+            }
+        };
+
+        let pending = tokio::select! {
+            biased;
+            result = handshake => result?,
+            () = WaitCancelled(self.canceller.as_ref()) => return Err(FfiError::Cancelled),
+        };
+
+        let fingerprint = pending.peer_fingerprint().ok_or_else(|| FfiError::Crypto {
+            message: "the peer did not present an identity key".to_owned(),
+        })?;
+
+        if let Some(expected) = self.security.expected_peer_fingerprint {
+            if expected != fingerprint {
+                pending.reject();
+                return Err(FfiError::IdentityMismatch {
+                    expected: fingerprint_hex(&expected),
+                    actual: fingerprint_hex(&fingerprint),
+                });
+            }
+        }
+
+        let mut secure = if self.security.trusts(&fingerprint) {
+            pending.confirm()?
+        } else {
+            self.verify(pending, &fingerprint).await?
+        };
+
+        let exchange = async {
+            let peer_id = exchange_peer_ids(&mut secure, &self.security.local_peer_id).await?;
+            let mode = if initiator {
+                write_mode(&mut secure, MODE_TRANSFER).await?;
+                let echoed = read_mode(&mut secure).await?;
+                if echoed != MODE_TRANSFER {
+                    return Err(FfiError::Protocol {
+                        message: "the peer did not acknowledge transfer mode".to_owned(),
+                    });
+                }
+                MODE_TRANSFER
+            } else {
+                let requested = read_mode(&mut secure).await?;
+                write_mode(&mut secure, requested).await?;
+                requested
+            };
+            Ok::<_, FfiError>((peer_id, mode))
+        };
+
+        let (peer_id, mode) = tokio::select! {
+            biased;
+            result = exchange => result?,
+            () = WaitCancelled(self.canceller.as_ref()) => return Err(FfiError::Cancelled),
+        };
+
+        self.set_peer(peer_id, fingerprint);
+        Ok((secure, mode))
+    }
+
+    /// Shows the SAS and waits for the foreign UI's decision.
+    async fn verify(
+        &self,
+        pending: PendingConnection<TcpStream>,
+        fingerprint: &[u8; 32],
+    ) -> Result<SecureStream<TcpStream>, FfiError> {
+        let sas = pending.sas();
+        let challenge = TransferEvent::VerificationRequired {
+            sas: sas.to_padded_string(),
+            peer_fingerprint: fingerprint_hex(fingerprint),
+            peer_public_key: pending
+                .peer_identity_public_key()
+                .unwrap_or_default()
+                .to_vec(),
+        };
+
+        let (sender, receiver) = oneshot::channel();
+        {
+            let mut slot = lock(&self.decision);
+            if slot.is_some() {
+                pending.reject();
+                return Err(FfiError::Protocol {
+                    message: "a verification is already pending".to_owned(),
+                });
+            }
+            *slot = Some(sender);
+        }
+
+        self.set_status(TransferStatus::Verifying);
+        self.emit(challenge);
+
+        let decision = tokio::select! {
+            biased;
+            result = tokio::time::timeout(self.security.verification_timeout, receiver) => {
+                match result {
+                    Ok(Ok(decision)) => decision,
+                    // The sender was dropped without an answer.
+                    Ok(Err(_)) => PeerDecision::Reject,
+                    Err(_) => {
+                        lock(&self.decision).take();
+                        pending.reject();
+                        return Err(FfiError::Timeout {
+                            message: "waiting for the user to verify the peer".to_owned(),
+                        });
+                    }
+                }
+            }
+            () = WaitCancelled(self.canceller.as_ref()) => {
+                lock(&self.decision).take();
+                pending.reject();
+                return Err(FfiError::Cancelled);
+            }
+        };
+        lock(&self.decision).take();
+
+        match decision {
+            PeerDecision::Confirm => Ok(pending.confirm()?),
+            PeerDecision::Reject => {
+                pending.reject();
+                Err(FfiError::VerificationRejected)
+            }
+        }
+    }
+
+    /// Records and publishes the binding between fingerprint and peer id.
+    fn set_peer(&self, peer_id: String, fingerprint: [u8; 32]) {
+        let peer_fingerprint = fingerprint_hex(&fingerprint);
+        {
+            let mut state = lock(&self.state);
+            state.peer_id = Some(peer_id.clone());
+            state.peer_fingerprint = Some(peer_fingerprint.clone());
+        }
+        self.emit(TransferEvent::PeerVerified {
+            peer_id,
+            peer_fingerprint,
+        });
+    }
+
+    fn peer_id(&self) -> Option<String> {
+        lock(&self.state).peer_id.clone()
+    }
+
+    fn peer_fingerprint(&self) -> Option<String> {
+        lock(&self.state).peer_fingerprint.clone()
+    }
+
+    /// Answers a pending [`TransferEvent::VerificationRequired`] with approval.
+    fn confirm_peer(&self) -> Result<(), FfiError> {
+        self.answer_peer(PeerDecision::Confirm)
+    }
+
+    /// Answers a pending [`TransferEvent::VerificationRequired`] by declining.
+    fn reject_peer(&self) -> Result<(), FfiError> {
+        self.answer_peer(PeerDecision::Reject)
+    }
+
+    fn answer_peer(&self, decision: PeerDecision) -> Result<(), FfiError> {
+        let sender = lock(&self.decision)
+            .take()
+            .ok_or_else(|| FfiError::invalid_argument("no peer verification is pending"))?;
+        sender
+            .send(decision)
+            .map_err(|_| FfiError::VerificationRejected)
     }
 
     /// Connects to the sender's chosen peer, observing cancellation.
@@ -508,7 +883,7 @@ impl FileTransferSession {
         file_path: String,
         options: SendOptions,
     ) -> Result<Arc<Self>, FfiError> {
-        options.validate()?;
+        let security = options.security()?;
         validate_endpoint(&address, &file_path)?;
         let payload_id = match options.payload_id {
             Some(id) => id,
@@ -520,6 +895,7 @@ impl FileTransferSession {
             file_path,
             Mode::Send(options),
             Some(payload_id),
+            security,
         )))
     }
 
@@ -539,7 +915,7 @@ impl FileTransferSession {
         destination: String,
         options: ReceiveOptions,
     ) -> Result<Arc<Self>, FfiError> {
-        options.validate()?;
+        let security = options.security()?;
         validate_endpoint(&listen_address, &destination)?;
         let payload_id = options.expected_payload_id;
         Ok(Arc::new(Self::assemble(
@@ -548,6 +924,7 @@ impl FileTransferSession {
             destination,
             Mode::Receive(options),
             payload_id,
+            security,
         )))
     }
 
@@ -577,6 +954,48 @@ impl FileTransferSession {
     #[must_use]
     pub fn report(&self) -> Option<TransferReport> {
         lock(&self.inner.state).report.clone()
+    }
+
+    /// Returns the peer id claimed after the authenticated handshake.
+    ///
+    /// The value is only meaningful once the connection has reached the
+    /// verification or running phase; it is bound to
+    /// [`Self::peer_fingerprint`] and never used for trust before that.
+    #[must_use]
+    pub fn peer_id(&self) -> Option<String> {
+        self.inner.peer_id()
+    }
+
+    /// Returns the SHA-256 fingerprint of the peer's identity key.
+    #[must_use]
+    pub fn peer_fingerprint(&self) -> Option<String> {
+        self.inner.peer_fingerprint()
+    }
+
+    /// Confirms the code shown by [`TransferEvent::VerificationRequired`].
+    ///
+    /// The session resumes as soon as the decision is delivered. Calling this
+    /// without a pending verification returns [`FfiError::InvalidArgument`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FfiError::InvalidArgument`] when no verification is pending,
+    /// or [`FfiError::VerificationRejected`] when the session has already
+    /// unwound.
+    pub fn confirm_peer(&self) -> Result<(), FfiError> {
+        self.inner.confirm_peer()
+    }
+
+    /// Declines the code shown by [`TransferEvent::VerificationRequired`].
+    ///
+    /// The connection is dropped and `run` resolves to
+    /// [`FfiError::VerificationRejected`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FfiError::InvalidArgument`] when no verification is pending.
+    pub fn reject_peer(&self) -> Result<(), FfiError> {
+        self.inner.reject_peer()
     }
 
     /// Requests cancellation.
@@ -648,6 +1067,7 @@ impl FileTransferSession {
         path: String,
         mode: Mode,
         payload_id: Option<u64>,
+        security: SecurityConfig,
     ) -> Self {
         let (sender, receiver) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
@@ -656,14 +1076,18 @@ impl FileTransferSession {
                 address,
                 path,
                 mode,
+                security,
                 canceller: Arc::new(Canceller::new()),
                 state: Mutex::new(SessionState {
                     status: TransferStatus::Idle,
                     report: None,
                     payload_id,
+                    peer_id: None,
+                    peer_fingerprint: None,
                 }),
                 events: Mutex::new(Some(sender)),
                 receiver: Arc::new(AsyncMutex::new(Some(receiver))),
+                decision: Mutex::new(None),
                 started: AtomicBool::new(false),
             }),
         }
@@ -689,7 +1113,7 @@ fn throttled_interval(requested_ms: u64) -> u64 {
 
 /// Maps a raw I/O failure through the transport error type for consistent
 /// classification.
-fn io_error(error: io::Error) -> FfiError {
+pub(crate) fn io_error(error: io::Error) -> FfiError {
     FfiError::from(core::TransferError::Io(error))
 }
 
@@ -731,8 +1155,8 @@ where
 /// a receive, writes for a send. Cancellation is checked on every poll and the
 /// task is woken by the [`Canceller`], so a socket blocked on a silent peer
 /// still terminates promptly.
-struct ProgressStream {
-    inner: TcpStream,
+struct ProgressStream<S> {
+    inner: S,
     total: Option<u64>,
     counter: Arc<AtomicU64>,
     canceller: Arc<Canceller>,
@@ -742,9 +1166,9 @@ struct ProgressStream {
     sender: broadcast::Sender<TransferEvent>,
 }
 
-impl ProgressStream {
+impl<S> ProgressStream<S> {
     fn new(
-        inner: TcpStream,
+        inner: S,
         total: Option<u64>,
         counter: Arc<AtomicU64>,
         canceller: Arc<Canceller>,
@@ -787,7 +1211,10 @@ impl ProgressStream {
     }
 }
 
-impl AsyncRead for ProgressStream {
+impl<S> AsyncRead for ProgressStream<S>
+where
+    S: AsyncRead + Unpin,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -807,7 +1234,10 @@ impl AsyncRead for ProgressStream {
     }
 }
 
-impl AsyncWrite for ProgressStream {
+impl<S> AsyncWrite for ProgressStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -856,9 +1286,16 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+    use crate::crypto::{PairingSession, PeerIdentity};
+
+    fn security_options() -> (Vec<u8>, String) {
+        let identity = Identity::generate().unwrap();
+        (identity.to_pkcs8().to_vec(), "test-peer".to_owned())
+    }
 
     #[test]
     fn constructors_choose_and_expose_payload_ids() {
+        let (identity_pkcs8, local_peer_id) = security_options();
         let sender = FileTransferSession::send(
             "127.0.0.1:1".to_owned(),
             "file.bin".to_owned(),
@@ -868,12 +1305,19 @@ mod tests {
                 verify_whole_file: true,
                 response_timeout_ms: 1_000,
                 progress_interval_ms: 100,
+                identity_pkcs8: identity_pkcs8.clone(),
+                local_peer_id: local_peer_id.clone(),
+                trusted_peer_fingerprints: Vec::new(),
+                expected_peer_fingerprint: None,
+                handshake_timeout_ms: 1_000,
+                verification_timeout_ms: 1_000,
             },
         )
         .unwrap();
         assert_eq!(sender.payload_id(), Some(7));
         assert_eq!(sender.direction(), TransferDirection::Send);
         assert_eq!(sender.status(), TransferStatus::Idle);
+        assert_eq!(sender.peer_id(), None);
 
         let receiver = FileTransferSession::receive(
             "127.0.0.1:0".to_owned(),
@@ -884,6 +1328,12 @@ mod tests {
                 verify_whole_file: false,
                 accept_timeout_ms: 1_000,
                 progress_interval_ms: 100,
+                identity_pkcs8,
+                local_peer_id,
+                trusted_peer_fingerprints: Vec::new(),
+                expected_peer_fingerprint: None,
+                handshake_timeout_ms: 1_000,
+                verification_timeout_ms: 1_000,
             },
         )
         .unwrap();
@@ -893,12 +1343,19 @@ mod tests {
 
     #[test]
     fn invalid_options_are_rejected_before_any_io() {
+        let (identity_pkcs8, local_peer_id) = security_options();
         let bad_chunk = SendOptions {
             payload_id: None,
             chunk_size: 0,
             verify_whole_file: true,
             response_timeout_ms: 1_000,
             progress_interval_ms: 100,
+            identity_pkcs8: identity_pkcs8.clone(),
+            local_peer_id: local_peer_id.clone(),
+            trusted_peer_fingerprints: Vec::new(),
+            expected_peer_fingerprint: None,
+            handshake_timeout_ms: 1_000,
+            verification_timeout_ms: 1_000,
         };
         assert!(matches!(
             FileTransferSession::send("host:1".into(), "f".into(), bad_chunk),
@@ -911,8 +1368,35 @@ mod tests {
             verify_whole_file: true,
             response_timeout_ms: 1_000,
             progress_interval_ms: 100,
+            identity_pkcs8,
+            local_peer_id,
+            trusted_peer_fingerprints: Vec::new(),
+            expected_peer_fingerprint: None,
+            handshake_timeout_ms: 1_000,
+            verification_timeout_ms: 1_000,
         };
         assert!(FileTransferSession::send("host:1".into(), "  ".into(), empty_path).is_err());
+    }
+
+    #[test]
+    fn missing_identity_is_rejected_before_any_io() {
+        let options = SendOptions {
+            payload_id: None,
+            chunk_size: core::CHUNK_SIZE,
+            verify_whole_file: true,
+            response_timeout_ms: 1_000,
+            progress_interval_ms: 100,
+            identity_pkcs8: Vec::new(),
+            local_peer_id: "test-peer".to_owned(),
+            trusted_peer_fingerprints: Vec::new(),
+            expected_peer_fingerprint: None,
+            handshake_timeout_ms: 1_000,
+            verification_timeout_ms: 1_000,
+        };
+        assert!(matches!(
+            FileTransferSession::send("host:1".into(), "f".into(), options),
+            Err(FfiError::InvalidArgument { .. })
+        ));
     }
 
     #[test]
@@ -920,5 +1404,344 @@ mod tests {
         assert_eq!(throttled_interval(0), MIN_PROGRESS_INTERVAL_MS);
         assert_eq!(throttled_interval(1), MIN_PROGRESS_INTERVAL_MS);
         assert_eq!(throttled_interval(100), 100);
+    }
+
+    use std::sync::atomic::AtomicU32;
+
+    struct TestIdentity {
+        pkcs8: Vec<u8>,
+        fingerprint: String,
+    }
+
+    fn test_identity() -> TestIdentity {
+        let identity = Identity::generate().unwrap();
+        TestIdentity {
+            pkcs8: identity.to_pkcs8().to_vec(),
+            fingerprint: fingerprint_hex(&identity.fingerprint()),
+        }
+    }
+
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "airbridge-ffi-{}-{tag}-{unique}.bin",
+            std::process::id()
+        ))
+    }
+
+    fn send_options(
+        identity: &TestIdentity,
+        peer_id: &str,
+        trusted: &[&str],
+        expected: Option<&str>,
+    ) -> SendOptions {
+        SendOptions {
+            payload_id: Some(77),
+            chunk_size: 64 * 1024,
+            verify_whole_file: true,
+            response_timeout_ms: 10_000,
+            progress_interval_ms: 50,
+            identity_pkcs8: identity.pkcs8.clone(),
+            local_peer_id: peer_id.to_owned(),
+            trusted_peer_fingerprints: trusted.iter().map(|value| (*value).to_owned()).collect(),
+            expected_peer_fingerprint: expected.map(str::to_owned),
+            handshake_timeout_ms: 10_000,
+            verification_timeout_ms: 10_000,
+        }
+    }
+
+    fn receive_options(
+        identity: &TestIdentity,
+        peer_id: &str,
+        trusted: &[&str],
+        expected: Option<&str>,
+    ) -> ReceiveOptions {
+        ReceiveOptions {
+            expected_payload_id: Some(77),
+            ack_every_bytes: 64 * 1024,
+            verify_whole_file: true,
+            accept_timeout_ms: 10_000,
+            progress_interval_ms: 50,
+            identity_pkcs8: identity.pkcs8.clone(),
+            local_peer_id: peer_id.to_owned(),
+            trusted_peer_fingerprints: trusted.iter().map(|value| (*value).to_owned()).collect(),
+            expected_peer_fingerprint: expected.map(str::to_owned),
+            handshake_timeout_ms: 10_000,
+            verification_timeout_ms: 10_000,
+        }
+    }
+
+    async fn wait_for_verification(session: &FileTransferSession) -> (String, String) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match session.next_event().await {
+                    Ok(Some(TransferEvent::VerificationRequired {
+                        sas,
+                        peer_fingerprint,
+                        ..
+                    })) => return (sas, peer_fingerprint),
+                    Ok(Some(TransferEvent::Failed { kind, message })) => {
+                        panic!("session failed before verification: {kind}: {message}")
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => panic!("event stream closed before verification"),
+                    Err(error) => panic!("event stream failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("verification event timed out")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_verified_transfer_round_trips_a_file() {
+        let sender_identity = test_identity();
+        let receiver_identity = test_identity();
+        let port = free_port();
+        let source = temp_path("source");
+        let destination = temp_path("destination");
+        tokio::fs::write(&source, b"authenticated payload")
+            .await
+            .unwrap();
+
+        let receiver = FileTransferSession::receive(
+            format!("127.0.0.1:{port}"),
+            destination.to_string_lossy().into_owned(),
+            receive_options(&receiver_identity, "receiver", &[], None),
+        )
+        .unwrap();
+
+        let receiver_task = tokio::spawn(receiver.clone().run());
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let sender = FileTransferSession::send(
+            format!("127.0.0.1:{port}"),
+            source.to_string_lossy().into_owned(),
+            send_options(&sender_identity, "sender", &[], None),
+        )
+        .unwrap();
+        let sender_task = tokio::spawn(sender.clone().run());
+
+        let (sender_sas, sender_seen) = wait_for_verification(&sender).await;
+        let (receiver_sas, receiver_seen) = wait_for_verification(&receiver).await;
+        assert_eq!(sender_sas, receiver_sas);
+        assert_eq!(sender_seen, receiver_identity.fingerprint);
+        assert_eq!(receiver_seen, sender_identity.fingerprint);
+
+        sender.confirm_peer().unwrap();
+        receiver.confirm_peer().unwrap();
+
+        let sender_report = sender_task.await.unwrap().unwrap();
+        let receiver_report = receiver_task.await.unwrap().unwrap();
+        assert!(!sender_report.pairing_only);
+        assert!(!receiver_report.pairing_only);
+        assert_eq!(receiver_report.peer_id.as_deref(), Some("sender"));
+        assert_eq!(
+            receiver_report.peer_fingerprint.as_deref(),
+            Some(sender_identity.fingerprint.as_str())
+        );
+        assert_eq!(
+            tokio::fs::read(&destination).await.unwrap(),
+            b"authenticated payload"
+        );
+
+        let _ = tokio::fs::remove_file(&source).await;
+        let _ = tokio::fs::remove_file(&destination).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_previously_verified_fingerprint_skips_the_prompt() {
+        let sender_identity = test_identity();
+        let receiver_identity = test_identity();
+        let port = free_port();
+        let source = temp_path("trusted-source");
+        let destination = temp_path("trusted-destination");
+        tokio::fs::write(&source, b"trusted payload").await.unwrap();
+
+        let receiver = FileTransferSession::receive(
+            format!("127.0.0.1:{port}"),
+            destination.to_string_lossy().into_owned(),
+            receive_options(
+                &receiver_identity,
+                "receiver",
+                &[sender_identity.fingerprint.as_str()],
+                Some(sender_identity.fingerprint.as_str()),
+            ),
+        )
+        .unwrap();
+        let receiver_task = tokio::spawn(receiver.clone().run());
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let sender = FileTransferSession::send(
+            format!("127.0.0.1:{port}"),
+            source.to_string_lossy().into_owned(),
+            send_options(
+                &sender_identity,
+                "sender",
+                &[receiver_identity.fingerprint.as_str()],
+                Some(receiver_identity.fingerprint.as_str()),
+            ),
+        )
+        .unwrap();
+        let sender_task = tokio::spawn(sender.clone().run());
+
+        let sender_report = sender_task.await.unwrap().unwrap();
+        let receiver_report = receiver_task.await.unwrap().unwrap();
+        assert_eq!(
+            sender_report.peer_fingerprint.as_deref(),
+            Some(receiver_identity.fingerprint.as_str())
+        );
+        assert_eq!(
+            receiver_report.peer_fingerprint.as_deref(),
+            Some(sender_identity.fingerprint.as_str())
+        );
+        assert_eq!(
+            tokio::fs::read(&destination).await.unwrap(),
+            b"trusted payload"
+        );
+
+        let _ = tokio::fs::remove_file(&source).await;
+        let _ = tokio::fs::remove_file(&destination).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pinned_identity_that_does_not_match_is_rejected() {
+        let sender_identity = test_identity();
+        let receiver_identity = test_identity();
+        let pinned = test_identity();
+        let port = free_port();
+        let source = temp_path("pinned-source");
+        let destination = temp_path("pinned-destination");
+        tokio::fs::write(&source, b"payload").await.unwrap();
+
+        let receiver = FileTransferSession::receive(
+            format!("127.0.0.1:{port}"),
+            destination.to_string_lossy().into_owned(),
+            receive_options(
+                &receiver_identity,
+                "receiver",
+                &[sender_identity.fingerprint.as_str()],
+                Some(sender_identity.fingerprint.as_str()),
+            ),
+        )
+        .unwrap();
+        let receiver_task = tokio::spawn(receiver.clone().run());
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let sender = FileTransferSession::send(
+            format!("127.0.0.1:{port}"),
+            source.to_string_lossy().into_owned(),
+            send_options(
+                &sender_identity,
+                "sender",
+                &[],
+                Some(pinned.fingerprint.as_str()),
+            ),
+        )
+        .unwrap();
+
+        let error = sender.run().await.unwrap_err();
+        assert!(matches!(error, FfiError::IdentityMismatch { .. }));
+        let _ = receiver_task.await;
+        let _ = tokio::fs::remove_file(&source).await;
+        let _ = tokio::fs::remove_file(&destination).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejecting_the_code_aborts_the_session() {
+        let sender_identity = test_identity();
+        let receiver_identity = test_identity();
+        let port = free_port();
+        let source = temp_path("reject-source");
+        let destination = temp_path("reject-destination");
+        tokio::fs::write(&source, b"payload").await.unwrap();
+
+        let receiver = FileTransferSession::receive(
+            format!("127.0.0.1:{port}"),
+            destination.to_string_lossy().into_owned(),
+            receive_options(&receiver_identity, "receiver", &[], None),
+        )
+        .unwrap();
+        let receiver_task = tokio::spawn(receiver.clone().run());
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let sender = FileTransferSession::send(
+            format!("127.0.0.1:{port}"),
+            source.to_string_lossy().into_owned(),
+            send_options(&sender_identity, "sender", &[], None),
+        )
+        .unwrap();
+        let sender_task = tokio::spawn(sender.clone().run());
+
+        let _ = wait_for_verification(&sender).await;
+        let _ = wait_for_verification(&receiver).await;
+
+        sender.reject_peer().unwrap();
+        receiver.reject_peer().unwrap();
+
+        assert!(matches!(
+            sender_task.await.unwrap(),
+            Err(FfiError::VerificationRejected)
+        ));
+        assert!(matches!(
+            receiver_task.await.unwrap(),
+            Err(FfiError::VerificationRejected)
+        ));
+
+        let _ = tokio::fs::remove_file(&source).await;
+        let _ = tokio::fs::remove_file(&destination).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pairing_only_connections_bind_the_peer_id_to_the_fingerprint() {
+        let sender_peer = PeerIdentity::generate().unwrap();
+        let sender_fingerprint = sender_peer.fingerprint();
+        let receiver_identity = test_identity();
+        let port = free_port();
+        let destination = temp_path("pairing-destination");
+
+        let receiver = FileTransferSession::receive(
+            format!("127.0.0.1:{port}"),
+            destination.to_string_lossy().into_owned(),
+            receive_options(&receiver_identity, "receiver", &[], None),
+        )
+        .unwrap();
+        let receiver_task = tokio::spawn(receiver.clone().run());
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let pairing = PairingSession::new(
+            format!("127.0.0.1:{port}"),
+            sender_peer,
+            "sender".to_owned(),
+            10_000,
+        )
+        .unwrap();
+        let challenge = pairing.clone().start().await.unwrap();
+        let (receiver_sas, receiver_seen) = wait_for_verification(&receiver).await;
+        assert_eq!(challenge.sas, receiver_sas);
+        assert_eq!(receiver_seen, sender_fingerprint);
+
+        receiver.confirm_peer().unwrap();
+        let result = pairing.confirm().await.unwrap();
+        assert_eq!(result.peer_id, "receiver");
+        assert_eq!(result.peer_fingerprint, receiver_identity.fingerprint);
+        assert_eq!(result.sas, challenge.sas);
+
+        let report = receiver_task.await.unwrap().unwrap();
+        assert!(report.pairing_only);
+        assert_eq!(report.payload_id, 0);
+        assert_eq!(report.peer_id.as_deref(), Some("sender"));
+        assert_eq!(
+            report.peer_fingerprint.as_deref(),
+            Some(sender_fingerprint.as_str())
+        );
+
+        let _ = tokio::fs::remove_file(&destination).await;
     }
 }

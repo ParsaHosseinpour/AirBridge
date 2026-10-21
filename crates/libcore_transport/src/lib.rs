@@ -2,10 +2,9 @@
 //!
 //! A high-throughput, memory-efficient engine that moves one file across one
 //! reliable byte stream. It is deliberately the *stream* layer: framing,
-//! chunking, per-chunk integrity and resumption. Authentication, encryption
-//! and multiplexing live above it — a `libcore_crypto` session can wrap the
-//! same stream without changing anything here — and discovery lives below it
-//! in `libcore_discovery`.
+//! chunking, per-chunk integrity and resumption. The `secure` module wraps
+//! that stream in the `libcore_crypto` handshake and AES-256-GCM frames before
+//! `HELLO` is written, and discovery lives below it in `libcore_discovery`.
 //!
 //! # Wire format
 //!
@@ -100,6 +99,7 @@ mod chunk;
 mod error;
 mod frame;
 mod receiver;
+mod secure;
 mod sender;
 mod state;
 
@@ -115,6 +115,7 @@ pub use frame::{
     LENGTH_PREFIX_LEN, MAX_FRAME_BODY, PAYLOAD_HEADER_LEN,
 };
 pub use receiver::{receive_file, ReceiveOptions, ReceiveReport};
+pub use secure::{connect_secure, initiate, respond, PendingConnection, SecureStream};
 pub use sender::{upload_file, UploadOptions, UploadReport};
 pub use state::{part_path, state_path_for, ResumeState, STATE_LEN, STATE_MAGIC, STATE_VERSION};
 

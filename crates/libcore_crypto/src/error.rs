@@ -74,6 +74,11 @@ pub enum CryptoError {
     /// A handshake message was structurally invalid.
     Encoding(&'static str),
 
+    /// A long-lived identity key could not be generated, loaded, or used.
+    ///
+    /// The detail is static and never contains private-key material.
+    Identity(&'static str),
+
     /// The handshake failed at the protocol level.
     ///
     /// `code` maps onto a UKEY2 `AlertType`; `detail` is a static description
@@ -122,6 +127,7 @@ impl CryptoError {
         match self {
             Self::Handshake { code, .. } => *code,
             Self::Encoding(_) => AlertCode::BadMessageData,
+            Self::Identity(_) => AlertCode::BadPublicKey,
             Self::KeyAgreement => AlertCode::BadPublicKey,
             Self::ReplayDetected { .. } | Self::FrameAuth | Self::FrameFormat(_) => {
                 AlertCode::BadMessage
@@ -151,6 +157,7 @@ impl fmt::Display for CryptoError {
             Self::KeyAgreement => f.write_str("elliptic-curve key agreement failed"),
             Self::KeySchedule => f.write_str("key derivation failed"),
             Self::Encoding(detail) => write!(f, "malformed message: {detail}"),
+            Self::Identity(detail) => write!(f, "identity key failure: {detail}"),
             Self::Handshake { code, detail } => {
                 write!(f, "handshake failure ({code:?}): {detail}")
             }

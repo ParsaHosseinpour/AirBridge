@@ -1,5 +1,5 @@
 using System;
-using AirBridge.Windows.Models;
+using System.Linq;
 using AirBridge.Windows.Services;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
@@ -8,39 +8,33 @@ using Microsoft.UI.Xaml.Controls;
 namespace AirBridge.Windows.Dialogs;
 
 /// <summary>
-/// Compare-the-code pairing prompt. When the gateway is a preview, the dialog
-/// says so in place and explains that the code is not cryptographic proof.
+/// Compare-the-code pairing prompt backed by the P-256 handshake. The code is
+/// the SAS from the encrypted exchange; the fingerprint is the durable identity
+/// that is stored when the user approves.
 /// </summary>
 public sealed partial class SasVerificationDialog : ContentDialog
 {
-    private static readonly TimeSpan ChallengeLifetime = TimeSpan.FromMinutes(2);
-
-    private readonly SasChallenge _challenge;
+    private readonly SasPrompt _prompt;
     private readonly DispatcherQueueTimer _timer;
 
-    public SasVerificationDialog(PeerDevice peer, SasChallenge challenge, bool isPreview)
+    public SasVerificationDialog(SasPrompt prompt)
     {
-        ArgumentNullException.ThrowIfNull(peer);
-        ArgumentNullException.ThrowIfNull(challenge);
+        ArgumentNullException.ThrowIfNull(prompt);
 
         InitializeComponent();
 
-        _challenge = challenge;
-        PeerNameText.Text = peer.Name;
-        PeerDetailText.Text = $"{peer.DeviceLabel} \u00B7 {peer.AddressText}";
-        PeerAvatar.Fill = peer.AvatarBrush;
-        PeerGlyph.Glyph = peer.Glyph;
-        CodeText.Text = FormatCode(challenge.Code);
+        _prompt = prompt;
+        Title = prompt.IsIncoming ? "Verify incoming device" : "Verify device";
+        PeerNameText.Text = prompt.PeerName;
+        PeerDetailText.Text = prompt.PeerDetail;
+        PeerGlyph.Glyph = prompt.Glyph;
+        CodeText.Text = FormatCode(prompt.Sas);
+        FingerprintText.Text = prompt.GroupedFingerprint;
 
-        PreviewPanel.Visibility = isPreview ? Visibility.Visible : Visibility.Collapsed;
-
-        if (isPreview)
+        if (prompt.IsIncoming)
         {
-            PrimaryButtonText = "Approve preview";
             InstructionText.Text =
-                "This build cannot exchange a PIN with the other device, so the two screens will not show the same code.";
-            FooterText.Text =
-                "Preview pairing does not verify the other device. Approve only when you trust the local network.";
+                "A device is asking to connect. Compare this code with the screen of the person sending the file.";
         }
 
         _timer = DispatcherQueue.CreateTimer();
@@ -54,7 +48,7 @@ public sealed partial class SasVerificationDialog : ContentDialog
 
     private void UpdateExpiry()
     {
-        var remaining = ChallengeLifetime - (DateTimeOffset.UtcNow - _challenge.CreatedAt);
+        var remaining = _prompt.ExpiresAt - DateTimeOffset.UtcNow;
         if (remaining <= TimeSpan.Zero)
         {
             ExpiryText.Text = "This code has expired.";
@@ -70,7 +64,12 @@ public sealed partial class SasVerificationDialog : ContentDialog
 
     private static string FormatCode(string code)
     {
-        code = code?.Trim() ?? string.Empty;
-        return code.Length == 6 ? $"{code[..3]} {code[3..]}" : code;
+        var digits = new string((code ?? string.Empty).Where(char.IsLetterOrDigit).ToArray());
+        if (digits.Length == 6)
+        {
+            return $"{digits[..3]} {digits[3..]}";
+        }
+
+        return string.Join(' ', digits.Chunk(3).Select(chunk => new string(chunk)));
     }
 }

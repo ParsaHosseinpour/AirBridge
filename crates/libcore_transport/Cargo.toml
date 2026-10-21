@@ -17,6 +17,8 @@ tokio = { workspace = true, features = ["fs", "io-util", "net", "rt", "sync", "t
 # SHA-256 for the chunk checksums. Same root of trust as the crypto core, so
 # the workspace keeps exactly one hashing implementation in its release graph.
 ring.workspace = true
+# Handshake, session keys and AEAD framing for the secure channel in `secure`.
+libcore_crypto = { path = "../libcore_crypto" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -28,8 +28,8 @@
 //!                              | next_protocol:lpp | commitment:[64]
 //! ServerInit      (0x02): tag | version:u32 | random:[32] | suite:u16
 //!                              | commitment:[64]
-//! ClientFinished  (0x03): tag | public_key:lpp
-//! ServerFinished  (0x04): tag | public_key:lpp
+//! ClientFinished  (0x03): tag | public_key:lpp | identity_public_key:lpp | identity_signature:lpp
+//! ServerFinished  (0x04): tag | public_key:lpp | identity_public_key:lpp | identity_signature:lpp
 //! Alert           (0x05): tag | code:u16 | message:lpp
 //! ```
 //!
@@ -241,11 +241,15 @@ pub(crate) struct ServerInit {
 /// The client's key reveal (UKEY2 `M3`).
 pub(crate) struct ClientFinished {
     pub(crate) public_key: Vec<u8>,
+    pub(crate) identity_public_key: Vec<u8>,
+    pub(crate) identity_signature: Vec<u8>,
 }
 
 /// The server's key reveal (AirBridge extension, `M4`).
 pub(crate) struct ServerFinished {
     pub(crate) public_key: Vec<u8>,
+    pub(crate) identity_public_key: Vec<u8>,
+    pub(crate) identity_signature: Vec<u8>,
 }
 
 pub(crate) fn encode_client_init(msg: &ClientInit) -> Result<Vec<u8>, CryptoError> {
@@ -317,23 +321,39 @@ pub(crate) fn decode_server_init(r: &mut Reader<'_>) -> Result<ServerInit, Crypt
 pub(crate) fn encode_client_finished(msg: &ClientFinished) -> Result<Vec<u8>, CryptoError> {
     let mut w = Writer::new(TAG_CLIENT_FINISHED);
     w.length_prefixed(&msg.public_key)?;
+    w.length_prefixed(&msg.identity_public_key)?;
+    w.length_prefixed(&msg.identity_signature)?;
     Ok(w.finish())
 }
 
 pub(crate) fn decode_client_finished(r: &mut Reader<'_>) -> Result<ClientFinished, CryptoError> {
     let public_key = r.length_prefixed()?.to_vec();
-    Ok(ClientFinished { public_key })
+    let identity_public_key = r.length_prefixed()?.to_vec();
+    let identity_signature = r.length_prefixed()?.to_vec();
+    Ok(ClientFinished {
+        public_key,
+        identity_public_key,
+        identity_signature,
+    })
 }
 
 pub(crate) fn encode_server_finished(msg: &ServerFinished) -> Result<Vec<u8>, CryptoError> {
     let mut w = Writer::new(TAG_SERVER_FINISHED);
     w.length_prefixed(&msg.public_key)?;
+    w.length_prefixed(&msg.identity_public_key)?;
+    w.length_prefixed(&msg.identity_signature)?;
     Ok(w.finish())
 }
 
 pub(crate) fn decode_server_finished(r: &mut Reader<'_>) -> Result<ServerFinished, CryptoError> {
     let public_key = r.length_prefixed()?.to_vec();
-    Ok(ServerFinished { public_key })
+    let identity_public_key = r.length_prefixed()?.to_vec();
+    let identity_signature = r.length_prefixed()?.to_vec();
+    Ok(ServerFinished {
+        public_key,
+        identity_public_key,
+        identity_signature,
+    })
 }
 
 /// Encodes an alert.

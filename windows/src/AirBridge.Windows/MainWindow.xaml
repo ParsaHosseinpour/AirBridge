@@ -478,6 +478,16 @@
                                         <TextBlock Text="Choose files" Style="{StaticResource BaseTextStyle}" FontSize="12" />
                                     </StackPanel>
                                 </Button>
+
+                                <Button Style="{StaticResource SecondaryButtonStyle}"
+                                        Click="OnVerifyPeerClick"
+                                        HorizontalAlignment="Stretch"
+                                        Visibility="{Binding CanVerifySelectedPeer, Converter={StaticResource BoolToVisibility}}">
+                                    <StackPanel Orientation="Horizontal" Spacing="7">
+                                        <FontIcon Glyph="&#xE72E;" FontFamily="Segoe MDL2 Assets" FontSize="12" />
+                                        <TextBlock Text="Verify device again" Style="{StaticResource BaseTextStyle}" FontSize="12" />
+                                    </StackPanel>
+                                </Button>
                             </StackPanel>
                         </Border>
 

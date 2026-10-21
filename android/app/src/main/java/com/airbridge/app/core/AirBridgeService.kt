@@ -195,6 +195,8 @@ class AirBridgeService : Service() {
 
     private fun transferText(transfer: TransferUi): String = when (transfer.phase) {
         TransferPhase.CONNECTING -> getString(R.string.notification_connecting, transfer.peerName)
+        TransferPhase.VERIFYING ->
+            getString(R.string.notification_verify_transfer, transfer.peerName)
         TransferPhase.RUNNING, TransferPhase.CANCELLING -> {
             val percent = transfer.percent
             if (transfer.direction == ShareDirection.SENDING) {
@@ -222,6 +224,7 @@ class AirBridgeService : Service() {
     }
 
     private fun incomingText(incoming: IncomingTransferUi): String = when (incoming.phase) {
+        IncomingPhase.VERIFYING -> getString(R.string.notification_incoming_verify)
         IncomingPhase.WAITING -> getString(R.string.notification_incoming_offer)
         IncomingPhase.RECEIVING -> {
             val percent = incoming.percent
@@ -237,6 +240,7 @@ class AirBridgeService : Service() {
             R.string.notification_incoming_saved,
             incoming.savedName ?: incoming.fileName,
         )
+        IncomingPhase.VERIFIED -> getString(R.string.notification_incoming_verified)
         IncomingPhase.FAILED -> getString(R.string.notification_incoming_failed)
         IncomingPhase.DECLINED -> getString(R.string.notification_cancelled)
     }

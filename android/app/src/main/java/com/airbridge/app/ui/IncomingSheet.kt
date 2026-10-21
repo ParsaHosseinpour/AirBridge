@@ -50,6 +50,7 @@ import com.airbridge.app.R
 import com.airbridge.app.model.IncomingPhase
 import com.airbridge.app.model.IncomingTransferUi
 import com.airbridge.app.model.formatBytes
+import com.airbridge.app.ui.theme.Amber
 import com.airbridge.app.ui.theme.Danger
 import com.airbridge.app.ui.theme.Mint
 import com.airbridge.app.ui.theme.PrimaryCyan
@@ -114,10 +115,18 @@ fun IncomingTransferSheet(
             )
 
             Spacer(Modifier.height(16.dp))
-            IncomingDetails(incoming)
+            if (incoming.phase == IncomingPhase.VERIFYING ||
+                incoming.phase == IncomingPhase.VERIFIED
+            ) {
+                IncomingVerificationDetails(incoming)
+            } else {
+                IncomingDetails(incoming)
+            }
 
             if (incoming.error != null &&
-                (incoming.phase == IncomingPhase.READY || incoming.phase == IncomingPhase.FAILED)
+                (incoming.phase == IncomingPhase.VERIFYING ||
+                    incoming.phase == IncomingPhase.READY ||
+                    incoming.phase == IncomingPhase.FAILED)
             ) {
                 Spacer(Modifier.height(12.dp))
                 IncomingErrorBanner(incoming.error)
@@ -125,6 +134,49 @@ fun IncomingTransferSheet(
 
             Spacer(Modifier.height(18.dp))
             when (incoming.phase) {
+                IncomingPhase.VERIFYING -> {
+                    val code = incoming.sas
+                    if (code != null) {
+                        SasCode(code)
+                        Spacer(Modifier.height(18.dp))
+                    }
+                    if (incoming.verificationSent) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.Center,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                color = PrimaryCyan,
+                                strokeWidth = 2.dp,
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Text(
+                                text = "Waiting for the other device…",
+                                color = TextPrimary,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                        }
+                    } else {
+                        PrimaryActionButton(
+                            text = "Codes match",
+                            iconRes = R.drawable.ic_check,
+                            onClick = onAccept,
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = code != null,
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        SecondaryActionButton(
+                            text = "Decline",
+                            iconRes = R.drawable.ic_close,
+                            onClick = onDecline,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+
                 IncomingPhase.WAITING -> {
                     PrimaryActionButton(
                         text = "Accept file",
@@ -191,7 +243,7 @@ fun IncomingTransferSheet(
                     }
                 }
 
-                IncomingPhase.SAVED -> {
+                IncomingPhase.SAVED, IncomingPhase.VERIFIED -> {
                     PrimaryActionButton(
                         text = "Done",
                         iconRes = R.drawable.ic_check,
@@ -238,6 +290,41 @@ private fun IncomingDetails(incoming: IncomingTransferUi) {
             IncomingInfoRow(
                 label = "Destination",
                 value = "Downloads/AirBridge",
+            )
+        }
+    }
+}
+
+@Composable
+private fun IncomingVerificationDetails(incoming: IncomingTransferUi) {
+    GlassSurface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            IncomingInfoRow(
+                label = "Device",
+                value = incoming.peerIdHex
+                    ?.take(16)
+                    ?.uppercase()
+                    ?: "Authenticating…",
+            )
+            Spacer(Modifier.height(10.dp))
+            IncomingInfoRow(
+                label = "Key",
+                value = incoming.peerFingerprint
+                    ?.take(16)
+                    ?.uppercase()
+                    ?: "SHA-256 pending",
+            )
+            Spacer(Modifier.height(10.dp))
+            IncomingInfoRow(
+                label = "Status",
+                value = if (incoming.phase == IncomingPhase.VERIFIED) {
+                    "Verified"
+                } else {
+                    "Compare the code on both screens"
+                },
             )
         }
     }
@@ -319,7 +406,8 @@ private fun IncomingProgressRing(
     )
 
     val target = when (incoming.phase) {
-        IncomingPhase.READY, IncomingPhase.SAVED, IncomingPhase.FAILED, IncomingPhase.DECLINED -> 1f
+        IncomingPhase.READY, IncomingPhase.SAVED, IncomingPhase.VERIFIED,
+        IncomingPhase.FAILED, IncomingPhase.DECLINED -> 1f
         else -> incoming.progress ?: 0f
     }
     val animated by animateFloatAsState(
@@ -330,7 +418,8 @@ private fun IncomingProgressRing(
 
     val color = ringColor(incoming.phase)
     val indeterminate = incoming.progress == null &&
-        (incoming.phase == IncomingPhase.WAITING ||
+        (incoming.phase == IncomingPhase.VERIFYING ||
+            incoming.phase == IncomingPhase.WAITING ||
             incoming.phase == IncomingPhase.RECEIVING ||
             incoming.phase == IncomingPhase.SAVING)
 
@@ -424,21 +513,25 @@ private fun IncomingProgressRing(
 }
 
 private fun ringColor(phase: IncomingPhase): Color = when (phase) {
-    IncomingPhase.READY, IncomingPhase.SAVED -> Mint
+    IncomingPhase.READY, IncomingPhase.SAVED, IncomingPhase.VERIFIED -> Mint
     IncomingPhase.FAILED -> Danger
     IncomingPhase.DECLINED -> TextMuted
     IncomingPhase.SAVING -> Mint
+    IncomingPhase.VERIFYING -> Amber
     else -> PrimaryCyan
 }
 
 private fun phaseIcon(phase: IncomingPhase): Int = when (phase) {
-    IncomingPhase.READY, IncomingPhase.SAVED -> R.drawable.ic_check
+    IncomingPhase.READY, IncomingPhase.SAVED, IncomingPhase.VERIFIED -> R.drawable.ic_check
     IncomingPhase.FAILED -> R.drawable.ic_warning
     IncomingPhase.DECLINED -> R.drawable.ic_close
+    IncomingPhase.VERIFYING -> R.drawable.ic_lock
     else -> R.drawable.ic_file
 }
 
 private fun title(incoming: IncomingTransferUi): String = when (incoming.phase) {
+    IncomingPhase.VERIFYING -> "Verify this device"
+    IncomingPhase.VERIFIED -> "Device verified"
     IncomingPhase.WAITING -> "Incoming file"
     IncomingPhase.RECEIVING -> "Receiving…"
     IncomingPhase.READY -> "Ready to save"
@@ -449,6 +542,10 @@ private fun title(incoming: IncomingTransferUi): String = when (incoming.phase) 
 }
 
 private fun subtitle(incoming: IncomingTransferUi): String = when (incoming.phase) {
+    IncomingPhase.VERIFYING ->
+        "Compare this code with the other screen. Nothing is accepted until you confirm."
+    IncomingPhase.VERIFIED ->
+        "${incoming.peerIdHex ?: "The device"} is verified. No file was transferred."
     IncomingPhase.WAITING ->
         "A nearby device is sending this file. Nothing is saved until you accept."
     IncomingPhase.RECEIVING ->

@@ -26,6 +26,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.airbridge.app.AirBridgeViewModel
+import com.airbridge.app.model.TransferPhase
 import com.airbridge.app.ui.theme.TextPrimary
 
 @Composable
@@ -125,11 +126,25 @@ fun AirBridgeApp(viewModel: AirBridgeViewModel) {
             onDismiss = viewModel::dismissIncoming,
         )
     } else {
-        pairing?.let { current ->
-            PairingSheet(
-                pairing = current,
+        val verifyingTransfer = transfer?.takeIf {
+            it.phase == TransferPhase.VERIFYING && it.sas != null
+        }
+        val currentPairing = pairing
+        when {
+            currentPairing != null -> VerificationSheet(
+                peerName = currentPairing.peer.name,
+                code = currentPairing.code,
+                busy = currentPairing.approving,
                 onApprove = viewModel::approvePairing,
                 onDismiss = viewModel::dismissPairing,
+            )
+
+            verifyingTransfer != null -> VerificationSheet(
+                peerName = verifyingTransfer.peerName,
+                code = verifyingTransfer.sas.orEmpty(),
+                busy = false,
+                onApprove = viewModel::confirmTransferVerification,
+                onDismiss = viewModel::rejectTransferVerification,
             )
         }
 

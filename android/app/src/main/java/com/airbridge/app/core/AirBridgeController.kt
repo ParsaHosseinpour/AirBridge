@@ -15,7 +15,11 @@ import com.airbridge.core.DiscoveryConfig
 import com.airbridge.core.DiscoveryEvent
 import com.airbridge.core.FfiException
 import com.airbridge.core.FileTransferSession
+import com.airbridge.core.PairingChallenge
+import com.airbridge.core.PairingResult
+import com.airbridge.core.PairingSession
 import com.airbridge.core.PeerDiscoveryEngine
+import com.airbridge.core.PeerIdentity
 import com.airbridge.core.PeerInfo
 import com.airbridge.core.SendOptions
 import com.airbridge.core.SubnetPolicy
@@ -25,6 +29,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -59,10 +64,10 @@ class AirBridgeController(
     context: Context,
     private val scope: CoroutineScope,
     private val preferences: AppPreferences,
-    private val sasGateway: SasGateway = LocalPreviewSasGateway(),
 ) {
     private val appContext = context.applicationContext
     private val engineMutex = Mutex()
+    private val pairingMutex = Mutex()
     private val started = AtomicBoolean(false)
 
     private val _discovery = MutableStateFlow(DiscoveryUiState(starting = true))
@@ -82,7 +87,13 @@ class AirBridgeController(
      * the whole service lifetime, independently of discovery, and is the
      * endpoint the Windows app connects to.
      */
-    private val inbound = InboundReceiver(appContext, scope) { message -> emit(message) }
+    private val inbound = InboundReceiver(
+        appContext,
+        scope,
+        preferences,
+        notify = { message -> emit(message) },
+        onPeerVerified = ::rememberVerifiedPeer,
+    )
 
     val incoming: StateFlow<IncomingTransferUi?> = inbound.incoming
 
@@ -94,6 +105,11 @@ class AirBridgeController(
     private var activeSession: FileTransferSession? = null
     private var cancelRequested = false
     private var wakeLock: PowerManager.WakeLock? = null
+
+    /** Lazily opened from the persisted PKCS#8 bytes and kept for the service. */
+    private var identityRef: PeerIdentity? = null
+    private var pairingSession: PairingSession? = null
+    private var pairingPeerId: String? = null
 
     // ---------------------------------------------------------------- lifecycle
 
@@ -146,6 +162,11 @@ class AirBridgeController(
         cancelRequested = true
         runCatching { activeSession?.cancel() }
         inbound.stop()
+        runCatching { pairingSession?.close() }
+        pairingSession = null
+        pairingPeerId = null
+        runCatching { identityRef?.close() }
+        identityRef = null
         runCatching { engine?.stop() }
         runCatching { engine?.close() }
         engine = null
@@ -300,20 +321,100 @@ class AirBridgeController(
 
     // ---------------------------------------------------------------- pairing
 
-    suspend fun createChallenge(peerIdHex: String): SasChallenge = sasGateway.challenge(peerIdHex)
+    /**
+     * Connects to [peer], runs the P-256 handshake and returns the real SAS
+     * plus the peer's identity fingerprint.
+     */
+    suspend fun createChallenge(peer: NearbyPeer): PairingChallenge = pairingMutex.withLock {
+        val address = peer.primaryAddress
+            ?: throw IOException("${peer.name} has no reachable address yet")
+        // A previous half-open attempt cannot coexist with a new one.
+        pairingSession?.let { previous ->
+            pairingSession = null
+            pairingPeerId = null
+            runCatching { previous.reject() }
+            runCatching { previous.close() }
+        }
+        val session = PairingSession(
+            address,
+            identity(),
+            preferences.peerIdHex,
+            PAIRING_TIMEOUT_MS.toULong(),
+        )
+        try {
+            val challenge = session.start()
+            pairingSession = session
+            pairingPeerId = peer.idHex
+            challenge
+        } catch (t: Throwable) {
+            runCatching { session.close() }
+            throw t
+        }
+    }
 
-    /** True while pairing is a local UI preview rather than real verification. */
-    val isPairingPreview: Boolean get() = sasGateway.isPreview
+    /**
+     * Releases the verified pairing channel and persists trust.
+     *
+     * Returns `null` when there is no pending challenge or the peer claims a
+     * different id than the device the user asked to verify; trust is never
+     * written in that case.
+     */
+    suspend fun approveChallenge(): PairingResult? = pairingMutex.withLock {
+        val session = pairingSession ?: return@withLock null
+        val expectedPeerId = pairingPeerId
+        pairingSession = null
+        pairingPeerId = null
+        val result = try {
+            session.confirm()
+        } catch (c: CancellationException) {
+            throw c
+        } catch (t: Throwable) {
+            emit(describe(t))
+            return@withLock null
+        } finally {
+            runCatching { session.close() }
+        }
+        if (expectedPeerId == null || !result.peerId.equals(expectedPeerId, ignoreCase = true)) {
+            emit("The device answered with a different identity")
+            return@withLock null
+        }
+        // The discovered id is the handle the peer list uses; the claimed id
+        // was just proven equal to it, so bind trust under that handle.
+        rememberVerifiedPeer(expectedPeerId, result.peerFingerprint)
+        result
+    }
 
-    suspend fun approveChallenge(challenge: SasChallenge): Boolean {
-        val approved = sasGateway.approve(challenge)
-        if (approved && !sasGateway.isPreview) {
-            preferences.trust(challenge.peerIdHex)
-            _peers.update { list ->
-                list.map { if (it.idHex == challenge.peerIdHex) it.copy(isTrusted = true) else it }
+    /** Drops a pending pairing attempt without creating trust. */
+    fun cancelPairing() {
+        val session = pairingSession ?: return
+        pairingSession = null
+        pairingPeerId = null
+        scope.launch(Dispatchers.IO) {
+            runCatching { session.reject() }
+            runCatching { session.close() }
+        }
+    }
+
+    private fun identity(): PeerIdentity = identityRef ?: PeerIdentity
+        .fromPkcs8(preferences.identityPkcs8)
+        .also { identityRef = it }
+
+    /**
+     * Records an authenticated id-to-fingerprint binding and marks it trusted.
+     * Only called for a peer whose SAS the user just confirmed (or whose
+     * fingerprint was already trusted and auto-confirmed by the FFI).
+     */
+    private fun rememberVerifiedPeer(peerId: String, fingerprint: String) {
+        preferences.trust(peerId, fingerprint)
+        _peers.update { list ->
+            list.map { peer ->
+                if (peer.idHex.equals(peerId, ignoreCase = true)) {
+                    peer.copy(isTrusted = true)
+                } else {
+                    peer
+                }
             }
         }
-        return approved
     }
 
     // ---------------------------------------------------------------- transfers
@@ -344,6 +445,20 @@ class AirBridgeController(
                 current.copy(phase = TransferPhase.CANCELLING)
             }
         }
+    }
+
+    /** Approves the SAS shown while an outgoing transfer is [TransferPhase.VERIFYING]. */
+    fun confirmTransferVerification() {
+        val session = activeSession ?: return
+        runCatching { session.confirmPeer() }
+            .onFailure { emit(describe(it)) }
+    }
+
+    /** Declines the SAS shown while an outgoing transfer is [TransferPhase.VERIFYING]. */
+    fun rejectTransferVerification() {
+        val session = activeSession ?: return
+        runCatching { session.rejectPeer() }
+            .onFailure { emit(describe(it)) }
     }
 
     fun dismissTransfer() {
@@ -395,55 +510,91 @@ class AirBridgeController(
 
                 try {
                     if (cancelRequested) break
-                    val session = try {
-                        FileTransferSession.send(address, staged.absolutePath, SendOptions())
-                    } catch (c: CancellationException) {
-                        throw c
-                    } catch (t: Throwable) {
-                        _transfer.update { it?.copy(phase = TransferPhase.FAILED, error = describe(t)) }
-                        break
-                    }
+                    var connectAttempt = 0
+                    while (!cancelRequested) {
+                        val options = try {
+                            sendOptions(peer)
+                        } catch (t: Throwable) {
+                            _transfer.update { it?.copy(phase = TransferPhase.FAILED, error = describe(t)) }
+                            break
+                        }
+                        val session = try {
+                            FileTransferSession.send(address, staged.absolutePath, options)
+                        } catch (c: CancellationException) {
+                            throw c
+                        } catch (t: Throwable) {
+                            _transfer.update { it?.copy(phase = TransferPhase.FAILED, error = describe(t)) }
+                            break
+                        }
 
-                    activeSession = session
-                    _transfer.update { it?.copy(phase = TransferPhase.RUNNING) }
-                    try {
-                        coroutineScope {
-                            val collector = launch {
-                                session.events().collect { event -> onTransferEvent(event) }
+                        activeSession = session
+                        var retry = false
+                        try {
+                            coroutineScope {
+                                val collector = launch {
+                                    session.events().collect { event -> onTransferEvent(event) }
+                                }
+                                try {
+                                    val report = session.run()
+                                    if (!cancelRequested) {
+                                        _transfer.update { current ->
+                                            if (current == null) null else current.copy(
+                                                phase = TransferPhase.COMPLETED,
+                                                bytesTransferred = report.totalBytes.toLong(),
+                                                totalBytes = report.totalBytes.toLong()
+                                                    .takeIf { it > 0L } ?: current.totalBytes,
+                                            )
+                                        }
+                                    }
+                                } catch (c: CancellationException) {
+                                    throw c
+                                } catch (t: Throwable) {
+                                    val cancelled = cancelRequested || t is FfiException.Cancelled
+                                    // Pairing and transfers share one listener
+                                    // port. Give a receiver that is re-arming
+                                    // after a pairing-only connection a few
+                                    // chances before failing the card. Never
+                                    // retry once a code was shown or the peer
+                                    // identity was already authenticated.
+                                    retry = !cancelled &&
+                                        t is FfiException.Io &&
+                                        connectAttempt < MAX_CONNECT_RETRIES &&
+                                        session.peerFingerprint() == null &&
+                                        _transfer.value?.sas == null
+                                    if (!retry) {
+                                        _transfer.update { current ->
+                                            if (current == null || current.phase.isTerminal) {
+                                                current
+                                            } else if (cancelled) {
+                                                current.copy(phase = TransferPhase.CANCELLED)
+                                            } else {
+                                                current.copy(phase = TransferPhase.FAILED, error = describe(t))
+                                            }
+                                        }
+                                    }
+                                } finally {
+                                    collector.cancelAndJoin()
+                                }
                             }
-                            try {
-                                val report = session.run()
-                                if (!cancelRequested) {
-                                    _transfer.update { current ->
-                                        if (current == null) null else current.copy(
-                                            phase = TransferPhase.COMPLETED,
-                                            bytesTransferred = report.totalBytes.toLong(),
-                                            totalBytes = report.totalBytes.toLong()
-                                                .takeIf { it > 0L } ?: current.totalBytes,
-                                        )
-                                    }
-                                }
-                            } catch (c: CancellationException) {
-                                throw c
-                            } catch (t: Throwable) {
-                                val cancelled = cancelRequested || t is FfiException.Cancelled
-                                _transfer.update { current ->
-                                    if (current == null || current.phase.isTerminal) {
-                                        current
-                                    } else if (cancelled) {
-                                        current.copy(phase = TransferPhase.CANCELLED)
-                                    } else {
-                                        current.copy(phase = TransferPhase.FAILED, error = describe(t))
-                                    }
-                                }
-                            } finally {
-                                collector.cancel()
+                        } finally {
+                            runCatching { session.close() }
+                            activeSession = null
+                        }
+
+                        if (!retry) break
+                        connectAttempt++
+                        _transfer.update { current ->
+                            if (current == null || current.phase.isTerminal) {
+                                current
+                            } else {
+                                current.copy(
+                                    phase = TransferPhase.CONNECTING,
+                                    sas = null,
+                                    error = null,
+                                )
                             }
                         }
-                    } finally {
-                        runCatching { session.close() }
-                        activeSession = null
-                        runCatching { staged.delete() }
+                        delay(CONNECT_RETRY_DELAY_MS)
                     }
                 } finally {
                     staged.delete()
@@ -479,7 +630,17 @@ class AirBridgeController(
                 is TransferEvent.Started -> current.copy(
                     phase = TransferPhase.RUNNING,
                     totalBytes = event.totalBytes?.toLong() ?: current.totalBytes,
+                    sas = null,
                 )
+                is TransferEvent.VerificationRequired -> current.copy(
+                    phase = TransferPhase.VERIFYING,
+                    sas = event.sas,
+                    peerFingerprint = event.peerFingerprint,
+                )
+                is TransferEvent.PeerVerified -> {
+                    rememberVerifiedPeer(event.peerId, event.peerFingerprint)
+                    current.copy(peerFingerprint = event.peerFingerprint)
+                }
                 is TransferEvent.Progress -> current.copy(
                     phase = if (current.phase == TransferPhase.CONNECTING) {
                         TransferPhase.RUNNING
@@ -493,6 +654,7 @@ class AirBridgeController(
                     phase = TransferPhase.COMPLETED,
                     bytesTransferred = event.report.totalBytes.toLong(),
                     totalBytes = event.report.totalBytes.toLong().takeIf { it > 0L } ?: current.totalBytes,
+                    sas = null,
                 )
                 is TransferEvent.Failed -> if (current.phase.isTerminal) {
                     current
@@ -500,16 +662,31 @@ class AirBridgeController(
                     current.copy(
                         phase = TransferPhase.FAILED,
                         error = event.message.ifBlank { event.kind },
+                        sas = null,
                     )
                 }
                 TransferEvent.Cancelled -> if (current.phase.isTerminal) {
                     current
                 } else {
-                    current.copy(phase = TransferPhase.CANCELLED)
+                    current.copy(phase = TransferPhase.CANCELLED, sas = null)
                 }
                 is TransferEvent.Lagged -> current
             }
         }
+    }
+
+    private fun sendOptions(peer: NearbyPeer): SendOptions {
+        val pinned = if (preferences.isTrusted(peer.idHex)) {
+            preferences.peerFingerprint(peer.idHex)
+        } else {
+            null
+        }
+        return SendOptions(
+            identityPkcs8 = preferences.identityPkcs8,
+            localPeerId = preferences.peerIdHex,
+            trustedPeerFingerprints = preferences.trustedFingerprints().toList(),
+            expectedPeerFingerprint = pinned,
+        )
     }
 
     private fun stageFile(file: SelectedFile): File {
@@ -564,10 +741,15 @@ class AirBridgeController(
         is FfiException.InvalidArgument -> t.message.ifBlank { "Invalid discovery configuration" }
         is FfiException.NotStarted -> "Discovery is not running"
         is FfiException.AlreadyStarted -> "Discovery is already running"
+        is FfiException.AlreadyFinished -> "This verification is no longer available"
         is FfiException.Timeout -> t.message.ifBlank { "The transfer timed out" }
         is FfiException.PeerClosed -> "The other device disconnected"
         is FfiException.PeerAborted -> "The other device cancelled the transfer"
         is FfiException.ChecksumMismatch -> "A checksum did not match"
+        is FfiException.Crypto -> t.message.ifBlank { "Secure connection failed" }
+        is FfiException.IdentityMismatch ->
+            "This device's security key changed. Verify it again before sending."
+        is FfiException.VerificationRejected -> "Verification was declined"
         is FfiException.Io -> t.message.ifBlank { "A network error interrupted the transfer" }
         is FfiException.Protocol -> "The other device sent invalid data"
         is UnsatisfiedLinkError -> "The native core is missing for this device's ABI"
@@ -582,5 +764,8 @@ class AirBridgeController(
         private const val WAKELOCK_TIMEOUT_MS = 15L * 60L * 1000L
         private const val COPY_BUFFER_BYTES = 256 * 1024
         private const val OUTGOING_DIR = "outgoing"
+        private const val PAIRING_TIMEOUT_MS = 30_000L
+        private const val MAX_CONNECT_RETRIES = 4
+        private const val CONNECT_RETRY_DELAY_MS = 600L
     }
 }

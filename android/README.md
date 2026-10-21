@@ -5,11 +5,10 @@ AirDrop-style radar, native peer discovery, and direct device-to-device file
 transfers. It talks to the Rust engine through UniFFI and JNA, and keeps
 discovery and transfers alive in a `connectedDevice` foreground service.
 
-The UI and service are complete. One backend piece is still deliberately
-stubbed because the current `libcore_ffi` surface does not expose it:
-
-* the pairing sheet uses a **local preview SAS gateway** — it does not yet
-  authenticate the remote device.
+The frontend is complete. Pairing and transfers use the same P-256 handshake
+and AES-256-GCM transport exported by `libcore_ffi`: both devices show a real
+SAS derived from the handshake transcript, and trust is stored against the
+peer's identity-key fingerprint.
 
 Inbound transfers are implemented: the service keeps a Rust receive session
 bound to the transfer port and asks the user before copying a verified payload
@@ -52,9 +51,8 @@ app/src/main/java/com/airbridge/app/
     InboundReceiver.kt            bound receive sessions, consent, re-arming
     IncomingFileStore.kt          Downloads/MediaStore commit, sniffing, sidecar hints
     AndroidBleBackend.kt          advertising/scanning and sighting forwarder
-    AppPreferences.kt             stable peer id, display name, trusted peers
+    AppPreferences.kt             stable peer id, identity key, verified fingerprints
     NativeCore.kt                 safe `libcore_ffi.so` availability check
-    SasGateway.kt                 pairing seam + local preview implementation
   model/Models.kt                 UI models and formatting helpers
   ui/
     AirBridgeApp.kt               root composable, file/permission pickers
@@ -189,8 +187,8 @@ service still runs; Android simply hides the notification from the drawer.
 1. Pick files with the system document picker, or drag document URIs onto the
    radar. Read access is persisted with `takePersistableUriPermission`.
 2. Tap a peer. With files selected, the radar sends immediately to a trusted
-   peer, or opens the PIN sheet for a new peer. Without files it opens the peer
-   sheet.
+   peer, or opens the verification sheet for a new peer. Without files it opens
+   the peer sheet.
 3. Files picked with the system picker keep read access through
    `takePersistableUriPermission` when the provider grants it. Each file is
    copied from its content URI into the app cache before the Rust
@@ -201,8 +199,8 @@ service still runs; Android simply hides the notification from the drawer.
 5. Cancellation calls `FileTransferSession.cancel()` and moves the UI to
    `CANCELLING` until the session reports its terminal state.
 
-The Rust `Progress` event counts framing bytes as well as file bytes, so the UI
-clamps the reported ratio to `0..1`.
+The Rust `Progress` event counts plaintext payload bytes; the UI still clamps
+the reported ratio to `0..1` for robustness.
 
 ### Receiving files
 
@@ -227,10 +225,11 @@ stays indeterminate until it is available.
 
 ### Identity and trust
 
-`AppPreferences` stores a random 32-hex-character peer id (generated with
-`SecureRandom` if the native engine does not provide one), the display name, and
-the set of locally trusted peer ids. Trusted peers get a mint ring and a check
-badge in the radar and in the peer sheet.
+`AppPreferences` stores the stable 32-hex-character peer id, the long-lived
+P-256 identity as Base64 PKCS#8, and the SHA-256 fingerprints the user verified.
+An id is trusted only while it is bound to a trusted fingerprint, so a device
+that reuses another device's advertised id cannot inherit its trust. Verified
+peers get a mint ring and a check badge in the radar and in the peer sheet.
 
 ## Permissions
 
@@ -261,36 +260,34 @@ avoids Android 12+ background-start restrictions. If the platform refuses to
 promote it to the foreground, the service logs the failure and continues while
 bound.
 
+## Security model
+
+Every connection begins with a P-256 key exchange authenticated by each
+device's long-lived ECDSA P-256 identity key. The handshake transcript yields
+the six-digit SAS shown on both screens and directional AES-256-GCM session
+keys; `HELLO` and payload frames travel only inside that encrypted channel.
+
+Trust is keyed by the SHA-256 fingerprint of the peer's identity key. The
+advertised peer id is treated as a discovery handle and is only bound to a key
+after an authenticated handshake; legacy `trusted_peer_ids` entries are
+discarded rather than migrated. The identity PKCS#8 key is generated once and
+stored Base64-encoded in private preferences; only its public key and
+fingerprint are exchanged.
+
+Pairing uses the same handshake and transfer port as a file transfer. A
+pairing-only connection is surfaced as a verified device and the receiver
+re-arms without offering or saving a file.
+
 ## Known limitations
-
-### Pairing is a UI preview
-
-The current FFI exposes discovery and transfer sessions only; the Rust SAS
-handshake is not exported. `SasGateway` is the seam for the real handshake, and
-`LocalPreviewSasGateway` supplies a six-digit code locally so the sheet and its
-state machine can be exercised.
-
-The preview:
-
-* generates a random code on this device and approves it after a short delay;
-* does not exchange a commitment or nonce with the peer;
-* does **not** authenticate anyone, and deliberately does **not** add the peer
-  to the locally trusted set.
-
-The pairing sheet displays a warning explaining this. To make verification
-real, implement `SasGateway` on top of the Rust handshake and inject it into
-`AirBridgeController`; only return `true` from `approve` once both devices have
-derived the same code. A real implementation should leave `isPreview` at its
-default `false` so a successful check can persist trust.
 
 ### Inbound payload metadata
 
-The AirBridge wire protocol carries no filename or peer identity, so the
-consent card says "Incoming file" and a timestamped name is generated after the
-payload is verified. Only one inbound offer is handled at a time; a verified
-file waiting for Save/Discard keeps the listener from re-arming. The sender is
-not asked before bytes start arriving — they are confined to the app cache until
-the user accepts.
+The AirBridge wire protocol carries no filename, so the consent card says
+"Incoming file" and a timestamped name is generated after the payload is
+verified. Only one inbound offer is handled at a time; a verified file waiting
+for Save/Discard keeps the listener from re-arming. The sender is not asked
+before bytes start arriving — they are confined to the app cache until the
+user accepts.
 
 ### Other notes
 

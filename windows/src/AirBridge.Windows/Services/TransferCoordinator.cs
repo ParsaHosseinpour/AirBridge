@@ -34,6 +34,19 @@ public sealed class TransferNotice : EventArgs
     public NoticeSeverity Severity { get; }
 }
 
+/// <summary>An authenticated id-to-key binding learned from a handshake.</summary>
+public sealed class PeerVerifiedEventArgs : EventArgs
+{
+    public PeerVerifiedEventArgs(string peerId, string peerFingerprint)
+    {
+        PeerId = peerId;
+        PeerFingerprint = peerFingerprint;
+    }
+
+    public string PeerId { get; }
+    public string PeerFingerprint { get; }
+}
+
 /// <summary>A file ready to leave the device.</summary>
 public sealed class OutgoingFile
 {
@@ -74,6 +87,8 @@ public sealed class TransferCoordinator : IAsyncDisposable
 
     private readonly DispatcherQueue _dispatcher;
     private readonly Func<AppSettings> _settings;
+    private readonly Func<byte[]?> _identityPkcs8;
+    private readonly Func<string, string?>? _peerNameLookup;
     private readonly SemaphoreSlim _sendSignal = new(0);
     private readonly ConcurrentQueue<TransferItem> _sendQueue = new();
     private readonly object _gate = new();
@@ -88,10 +103,16 @@ public sealed class TransferCoordinator : IAsyncDisposable
     private string? _lastReceiverError;
     private bool _disposed;
 
-    public TransferCoordinator(DispatcherQueue dispatcher, Func<AppSettings> settings)
+    public TransferCoordinator(
+        DispatcherQueue dispatcher,
+        Func<AppSettings> settings,
+        Func<byte[]?> identityPkcs8,
+        Func<string, string?>? peerNameLookup = null)
     {
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));
+        _identityPkcs8 = identityPkcs8 ?? throw new ArgumentNullException(nameof(identityPkcs8));
+        _peerNameLookup = peerNameLookup;
     }
 
     /// <summary>All transfers, newest first. Only touched on the UI thread.</summary>
@@ -100,7 +121,14 @@ public sealed class TransferCoordinator : IAsyncDisposable
     /// <summary>True while an inbound listener is bound.</summary>
     public bool IsReceiverListening { get; private set; }
 
+    /// <summary>
+    /// Shows the SAS dialog and returns the user's decision. Verification is
+    /// required before the encrypted channel is allowed to move payload bytes.
+    /// </summary>
+    public Func<SasPrompt, Task<bool>>? VerificationPrompt { get; set; }
+
     public event EventHandler<TransferNotice>? Notice;
+    public event EventHandler<PeerVerifiedEventArgs>? PeerVerified;
     public event EventHandler? ReceiverStateChanged;
 
     public void Start(AppSettings settings)
@@ -348,6 +376,11 @@ public sealed class TransferCoordinator : IAsyncDisposable
             return;
         }
 
+        // Pairing and the file transfer use the same listener port. The
+        // receiver needs a moment to re-arm after a pairing-only connection, so
+        // retry a refused connection a few times before failing the card.
+        var connectAttempts = 0;
+
         while (!token.IsCancellationRequested)
         {
             Post(item.MarkConnecting);
@@ -357,13 +390,25 @@ public sealed class TransferCoordinator : IAsyncDisposable
 
             try
             {
+                var settings = _settings();
+                var identity = _identityPkcs8();
+                if (identity is null || identity.Length == 0)
+                {
+                    throw new FfiException.InvalidArgument(
+                        "This device's identity is not ready yet. Restart AirBridge and try again.");
+                }
+
                 session = FileTransferSession.Send(
                     item.Address,
                     item.SourcePath,
                     new SendOptions(
+                        IdentityPkcs8: identity,
+                        TrustedPeerFingerprints: settings.TrustedFingerprints.ToArray(),
                         PayloadId: item.PayloadId,
                         ResponseTimeoutMs: 90_000,
-                        ProgressIntervalMs: 100));
+                        ProgressIntervalMs: 100,
+                        LocalPeerId: settings.PeerIdHex ?? string.Empty,
+                        ExpectedPeerFingerprint: settings.PeerFingerprint(item.PeerIdHex)));
             }
             catch (Exception error)
             {
@@ -395,7 +440,7 @@ public sealed class TransferCoordinator : IAsyncDisposable
                 }
 
                 events = new FileTransferEvents(session);
-                events.EventReceived += (_, transferEvent) => OnTransferEvent(item, transferEvent);
+                events.EventReceived += (_, transferEvent) => OnTransferEvent(item, sessionReference, transferEvent);
                 events.Start();
 
                 var report = await session.Run().ConfigureAwait(false);
@@ -442,6 +487,27 @@ public sealed class TransferCoordinator : IAsyncDisposable
                     return;
                 }
 
+                if (!item.CancelRequested &&
+                    item.Phase is TransferPhase.Queued or TransferPhase.Connecting &&
+                    connectAttempts < 4 &&
+                    error is FfiException.Io)
+                {
+                    connectAttempts++;
+                    AppLog.Info(
+                        $"Retrying connection to {item.Address} ({connectAttempts}/4) after a refused connection.");
+                    try
+                    {
+                        await Task.Delay(600, token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        Post(item.MarkCancelled);
+                        return;
+                    }
+
+                    continue;
+                }
+
                 Post(() => item.MarkFailed(Format.FriendlyException(error)));
                 return;
             }
@@ -480,10 +546,30 @@ public sealed class TransferCoordinator : IAsyncDisposable
         return signal.Task;
     }
 
-    private void OnTransferEvent(TransferItem item, TransferEvent transferEvent)
+    private void OnTransferEvent(
+        TransferItem item,
+        FileTransferSession session,
+        TransferEvent transferEvent)
     {
         switch (transferEvent)
         {
+            case TransferEvent.VerificationRequired verification:
+                Post(() => item.MarkVerifying(verification.Sas, verification.PeerFingerprint));
+                BeginVerification(item, session, verification);
+                break;
+            case TransferEvent.PeerVerified verified:
+                Post(() =>
+                {
+                    item.ApplyPeerIdentity(verified.PeerId, verified.PeerFingerprint);
+                    if (_peerNameLookup?.Invoke(verified.PeerId) is { Length: > 0 } name)
+                    {
+                        item.UpdatePeerName(name);
+                    }
+                });
+                PeerVerified?.Invoke(
+                    this,
+                    new PeerVerifiedEventArgs(verified.PeerId, verified.PeerFingerprint));
+                break;
             case TransferEvent.Started started:
                 Post(() =>
                 {
@@ -537,6 +623,75 @@ public sealed class TransferCoordinator : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Asks the user to compare the SAS, then releases or drops the encrypted
+    /// channel. The event pump is not blocked: the FFI waits for the decision.
+    /// </summary>
+    private void BeginVerification(
+        TransferItem item,
+        FileTransferSession session,
+        TransferEvent.VerificationRequired verification)
+    {
+        _ = ConfirmVerificationAsync(item, session, verification);
+    }
+
+    private async Task ConfirmVerificationAsync(
+        TransferItem item,
+        FileTransferSession session,
+        TransferEvent.VerificationRequired verification)
+    {
+        try
+        {
+            var settings = _settings();
+            var knownPeerId = settings.PeerIdForFingerprint(verification.PeerFingerprint);
+            var knownName = knownPeerId is null ? null : _peerNameLookup?.Invoke(knownPeerId);
+            var isSend = item.Direction == TransferDirection.Send;
+
+            var prompt = new SasPrompt(
+                verification.Sas,
+                verification.PeerFingerprint,
+                knownName ?? (isSend ? item.PeerName : "Nearby device"),
+                isSend ? $"{item.PeerName} \u00B7 {item.Address}" : "Incoming connection",
+                isIncoming: !isSend,
+                glyph: isSend ? "\uE8D4" : "\uE7BA");
+
+            var approved = false;
+            var handler = VerificationPrompt;
+            if (handler is not null)
+            {
+                try
+                {
+                    approved = await handler(prompt).ConfigureAwait(false);
+                }
+                catch (Exception error)
+                {
+                    AppLog.Error("The verification prompt failed.", error);
+                    approved = false;
+                }
+            }
+
+            if (item.IsTerminal)
+            {
+                return;
+            }
+
+            if (approved)
+            {
+                session.ConfirmPeer();
+            }
+            else
+            {
+                session.RejectPeer();
+            }
+        }
+        catch (Exception error)
+        {
+            // The session may have timed out or been cancelled while the
+            // dialog was open. Its own failure path updates the card.
+            AppLog.Warn("The verification decision could not be delivered.", error);
+        }
+    }
+
     private async Task ReceiveLoopAsync(CancellationToken token)
     {
         var retryDelay = ReceiverRetryDelayMs;
@@ -568,15 +723,25 @@ public sealed class TransferCoordinator : IAsyncDisposable
                     settings.DownloadDirectory,
                     $".airbridge-incoming-{Guid.NewGuid():N}.bin");
 
+                var identity = _identityPkcs8();
+                if (identity is null || identity.Length == 0)
+                {
+                    throw new FfiException.InvalidArgument(
+                        "This device's identity is not ready yet.");
+                }
+
                 session = FileTransferSession.Receive(
                     $"0.0.0.0:{settings.ListenPort}",
                     destination,
                     new ReceiveOptions(
+                        IdentityPkcs8: identity,
+                        TrustedPeerFingerprints: settings.TrustedFingerprints.ToArray(),
                         ExpectedPayloadId: null,
                         AckEveryBytes: 4 * 1024 * 1024,
                         VerifyWholeFile: true,
                         AcceptTimeoutMs: AcceptTimeoutMs,
-                        ProgressIntervalMs: 100));
+                        ProgressIntervalMs: 100,
+                        LocalPeerId: settings.PeerIdHex ?? string.Empty));
 
                 var receiveItem = new TransferItem(
                     TransferDirection.Receive,
@@ -599,7 +764,7 @@ public sealed class TransferCoordinator : IAsyncDisposable
 
                 events = new FileTransferEvents(session);
                 events.EventReceived += (_, transferEvent) =>
-                    OnReceiveEvent(receiveItem, transferEvent, settings, ref announced);
+                    OnReceiveEvent(receiveItem, session, transferEvent, settings, ref announced);
                 events.Start();
 
                 try
@@ -674,12 +839,41 @@ public sealed class TransferCoordinator : IAsyncDisposable
 
     private void OnReceiveEvent(
         TransferItem item,
+        FileTransferSession session,
         TransferEvent transferEvent,
         AppSettings settings,
         ref bool announced)
     {
         switch (transferEvent)
         {
+            case TransferEvent.VerificationRequired verification:
+                // The handshake is complete, so this is a real AirBridge peer.
+                // Show the card while the user compares the SAS.
+                announced = true;
+                Post(() =>
+                {
+                    if (!Transfers.Contains(item))
+                    {
+                        Transfers.Insert(0, item);
+                    }
+
+                    item.MarkVerifying(verification.Sas, verification.PeerFingerprint);
+                });
+                BeginVerification(item, session, verification);
+                break;
+            case TransferEvent.PeerVerified verified:
+                Post(() =>
+                {
+                    item.ApplyPeerIdentity(verified.PeerId, verified.PeerFingerprint);
+                    if (_peerNameLookup?.Invoke(verified.PeerId) is { Length: > 0 } name)
+                    {
+                        item.UpdatePeerName(name);
+                    }
+                });
+                PeerVerified?.Invoke(
+                    this,
+                    new PeerVerifiedEventArgs(verified.PeerId, verified.PeerFingerprint));
+                break;
             case TransferEvent.Started:
                 // A TCP connection was accepted. Wait for actual payload
                 // progress before showing the transfer: the listener is on a
@@ -706,6 +900,22 @@ public sealed class TransferCoordinator : IAsyncDisposable
                         item.ApplyProgress(progress.BytesTransferred, progress.TotalBytes);
                     }
                 });
+                break;
+            case TransferEvent.Completed completed when completed.Report.PairingOnly:
+                announced = true;
+                TryDeletePairingArtifacts(item.SourcePath);
+                Post(() =>
+                {
+                    if (!Transfers.Contains(item))
+                    {
+                        Transfers.Insert(0, item);
+                    }
+
+                    item.MarkCompleted(completed.Report);
+                });
+
+                Notify("Device verified.", NoticeSeverity.Success);
+                _ = DismissPairingCardAsync(item);
                 break;
             case TransferEvent.Completed completed:
                 announced = true;
@@ -753,9 +963,50 @@ public sealed class TransferCoordinator : IAsyncDisposable
         }
     }
 
+    private async Task DismissPairingCardAsync(TransferItem item)
+    {
+        await Task.Delay(TimeSpan.FromSeconds(6)).ConfigureAwait(false);
+        Post(() =>
+        {
+            if (item.PairingOnly && item.IsTerminal)
+            {
+                Transfers.Remove(item);
+            }
+        });
+    }
+
+    /// <summary>Removes the unused staging file left by a pairing-only accept.</summary>
+    private static void TryDeletePairingArtifacts(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        foreach (var candidate in new[] { path, path + ".part", path + ".part.state" })
+        {
+            try
+            {
+                if (File.Exists(candidate))
+                {
+                    File.Delete(candidate);
+                }
+            }
+            catch (Exception error)
+            {
+                AppLog.Warn($"Could not remove the pairing staging file {candidate}.", error);
+            }
+        }
+    }
+
     /// <summary>Renames a committed receive with a sniffed extension and a friendly name.</summary>
     private string? CommitReceivedFile(string committedPath, TransferReport report, AppSettings settings)
     {
+        if (report.PairingOnly)
+        {
+            return null;
+        }
+
         try
         {
             var path = string.IsNullOrWhiteSpace(report.DestinationPath) ? committedPath : report.DestinationPath;

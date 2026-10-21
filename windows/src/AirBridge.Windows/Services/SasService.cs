@@ -1,73 +1,78 @@
 using System;
-using System.Globalization;
-using System.Security.Cryptography;
-using System.Threading.Tasks;
+using System.Linq;
 
 namespace AirBridge.Windows.Services;
 
-/// <summary>A short authentication string the user compares out of band.</summary>
-public sealed class SasChallenge
+/// <summary>
+/// A short authentication string produced by the P-256 handshake, together
+/// with the peer key it authenticates. The user compares the code out of band
+/// and the fingerprint is what is remembered as trusted.
+/// </summary>
+public sealed class SasPrompt
 {
-    public SasChallenge(string peerIdHex, string code, DateTimeOffset createdAt)
+    public SasPrompt(
+        string sas,
+        string peerFingerprint,
+        string peerName,
+        string peerDetail,
+        bool isIncoming,
+        string glyph = "\uE7BA",
+        TimeSpan? lifetime = null)
     {
-        PeerIdHex = peerIdHex;
-        Code = code;
-        CreatedAt = createdAt;
+        Sas = string.IsNullOrWhiteSpace(sas) ? string.Empty : sas.Trim();
+        PeerFingerprint = string.IsNullOrWhiteSpace(peerFingerprint)
+            ? string.Empty
+            : peerFingerprint.Trim().ToLowerInvariant();
+        PeerName = string.IsNullOrWhiteSpace(peerName) ? "Nearby device" : peerName.Trim();
+        PeerDetail = peerDetail?.Trim() ?? string.Empty;
+        IsIncoming = isIncoming;
+        Glyph = string.IsNullOrWhiteSpace(glyph) ? "\uE7BA" : glyph;
+        CreatedAt = DateTimeOffset.UtcNow;
+        Lifetime = lifetime ?? TimeSpan.FromMinutes(2);
     }
 
-    public string PeerIdHex { get; }
-    public string Code { get; }
+    /// <summary>Six digits from the handshake transcript.</summary>
+    public string Sas { get; }
+
+    /// <summary>SHA-256 fingerprint of the peer's long-lived identity key.</summary>
+    public string PeerFingerprint { get; }
+
+    public string PeerName { get; }
+
+    public string PeerDetail { get; }
+
+    public bool IsIncoming { get; }
+
+    /// <summary>Segoe MDL2 glyph used by the dialog avatar.</summary>
+    public string Glyph { get; }
+
     public DateTimeOffset CreatedAt { get; }
-    public bool IsExpired => DateTimeOffset.UtcNow - CreatedAt > TimeSpan.FromMinutes(2);
-}
 
-/// <summary>
-/// Boundary between the UI and the cryptographic pairing handshake.
-///
-/// <c>libcore_ffi</c> currently exports discovery and one-file transfer
-/// sessions, but not the crypto crate's SAS handshake. The Windows app
-/// therefore talks to this seam, exactly as the Android app does. The preview
-/// implementation must not be presented as proof of identity, and it never
-/// persists trust.
-/// </summary>
-public interface ISasGateway
-{
-    /// <summary>Whether this gateway is a local demo rather than real verification.</summary>
-    bool IsPreview { get; }
+    public TimeSpan Lifetime { get; }
 
-    Task<SasChallenge> ChallengeAsync(string peerIdHex);
+    public DateTimeOffset ExpiresAt => CreatedAt + Lifetime;
 
-    Task<bool> ApproveAsync(SasChallenge challenge);
-}
+    public string ShortFingerprint =>
+        string.IsNullOrWhiteSpace(PeerFingerprint)
+            ? "unknown key"
+            : PeerFingerprint.Length <= 16
+                ? PeerFingerprint
+                : $"{PeerFingerprint[..8]}…{PeerFingerprint[^8..]}";
 
-/// <summary>
-/// Development stand-in used until the Rust SAS handshake is exported across
-/// the FFI. It produces a local six-digit code, simulates the round trip, and
-/// accepts any unexpired challenge. It deliberately does not authenticate the
-/// remote device.
-/// </summary>
-public sealed class LocalPreviewSasGateway : ISasGateway
-{
-    private static readonly TimeSpan ChallengeLifetime = TimeSpan.FromMinutes(2);
-
-    public bool IsPreview => true;
-
-    public async Task<SasChallenge> ChallengeAsync(string peerIdHex)
+    public string GroupedFingerprint
     {
-        await Task.Delay(220).ConfigureAwait(false);
-        var code = RandomNumberGenerator.GetInt32(0, 1_000_000)
-            .ToString("D6", CultureInfo.InvariantCulture);
-        return new SasChallenge(peerIdHex, code, DateTimeOffset.UtcNow);
-    }
-
-    public async Task<bool> ApproveAsync(SasChallenge challenge)
-    {
-        if (challenge is null)
+        get
         {
-            throw new ArgumentNullException(nameof(challenge));
-        }
+            if (string.IsNullOrWhiteSpace(PeerFingerprint))
+            {
+                return string.Empty;
+            }
 
-        await Task.Delay(260).ConfigureAwait(false);
-        return !challenge.IsExpired && DateTimeOffset.UtcNow - challenge.CreatedAt < ChallengeLifetime;
+            var chunks = PeerFingerprint
+                .ToLowerInvariant()
+                .Chunk(4)
+                .Select(chunk => new string(chunk));
+            return string.Join(' ', chunks);
+        }
     }
 }

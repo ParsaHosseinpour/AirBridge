@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using AirBridge.Windows.Controls;
 using AirBridge.Windows.Core;
@@ -28,9 +29,9 @@ public sealed partial class MainWindow : Window
 {
     private readonly MainViewModel _viewModel;
     private readonly IntPtr _windowHandle;
+    private readonly SemaphoreSlim _dialogs = new(1, 1);
 
     private bool _loaded;
-    private bool _dialogOpen;
     private bool _closed;
 
     public MainWindow()
@@ -128,18 +129,19 @@ public sealed partial class MainWindow : Window
 
     // -------------------------------------------------------------- dialogs
 
-    private async Task<bool> ShowVerificationAsync(PeerDevice peer, SasChallenge challenge)
+    private async Task<bool> ShowVerificationAsync(SasPrompt prompt)
     {
-        if (RootGrid.XamlRoot is null || _dialogOpen)
+        if (RootGrid.XamlRoot is null)
         {
             return false;
         }
 
-        _dialogOpen = true;
-
+        // Incoming verification can arrive while Settings is open. Wait for
+        // the other dialog rather than silently rejecting the peer.
+        await _dialogs.WaitAsync();
         try
         {
-            var dialog = new SasVerificationDialog(peer, challenge, _viewModel.IsPairingPreview)
+            var dialog = new SasVerificationDialog(prompt)
             {
                 XamlRoot = RootGrid.XamlRoot,
             };
@@ -154,18 +156,18 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
-            _dialogOpen = false;
+            _dialogs.Release();
         }
     }
 
     private async void OnSettingsClick(object sender, RoutedEventArgs args)
     {
-        if (RootGrid.XamlRoot is null || _dialogOpen)
+        if (RootGrid.XamlRoot is null)
         {
             return;
         }
 
-        _dialogOpen = true;
+        await _dialogs.WaitAsync();
         var pageOffset = PageScroll.VerticalOffset;
 
         try
@@ -188,7 +190,7 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
-            _dialogOpen = false;
+            _dialogs.Release();
 
             // Showing the dialog can make the page scroll to the focused
             // setting. Put the page back where the user left it.
@@ -271,6 +273,19 @@ public sealed partial class MainWindow : Window
         catch (Exception error)
         {
             AppLog.Error("Sending failed unexpectedly.", error);
+            _viewModel.ShowBanner(Format.FriendlyException(error), NoticeSeverity.Error);
+        }
+    }
+
+    private async void OnVerifyPeerClick(object sender, RoutedEventArgs args)
+    {
+        try
+        {
+            await _viewModel.VerifySelectedPeerAsync();
+        }
+        catch (Exception error)
+        {
+            AppLog.Error("Re-verification failed unexpectedly.", error);
             _viewModel.ShowBanner(Format.FriendlyException(error), NoticeSeverity.Error);
         }
     }

@@ -18,7 +18,6 @@ import com.airbridge.app.core.AirBridgeController
 import com.airbridge.app.core.AirBridgeService
 import com.airbridge.app.core.AppPreferences
 import com.airbridge.app.core.ControllerEvent
-import com.airbridge.app.core.SasChallenge
 import com.airbridge.app.model.DiscoveryUiState
 import com.airbridge.app.model.IncomingPhase
 import com.airbridge.app.model.IncomingTransferUi
@@ -49,7 +48,6 @@ import kotlinx.coroutines.withContext
 data class PairingUi(
     val peer: NearbyPeer,
     val code: String,
-    val challenge: SasChallenge,
     val filesAfterApproval: List<SelectedFile>?,
     val approving: Boolean = false,
 )
@@ -329,6 +327,16 @@ class AirBridgeViewModel(application: Application) : AndroidViewModel(applicatio
         _activeController.value?.dismissTransfer()
     }
 
+    /** Confirms the SAS shown for an outgoing transfer awaiting verification. */
+    fun confirmTransferVerification() {
+        _activeController.value?.confirmTransferVerification()
+    }
+
+    /** Declines the SAS shown for an outgoing transfer awaiting verification. */
+    fun rejectTransferVerification() {
+        _activeController.value?.rejectTransferVerification()
+    }
+
     // --------------------------------------------------------------- incoming
 
     /**
@@ -374,11 +382,10 @@ class AirBridgeViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             val controller = _activeController.value ?: return@launch
             try {
-                val challenge = controller.createChallenge(peer.idHex)
+                val challenge = controller.createChallenge(peer)
                 _pairing.value = PairingUi(
                     peer = peer,
-                    code = challenge.code,
-                    challenge = challenge,
+                    code = challenge.sas,
                     filesAfterApproval = files.ifEmpty { null },
                 )
             } catch (c: CancellationException) {
@@ -395,29 +402,23 @@ class AirBridgeViewModel(application: Application) : AndroidViewModel(applicatio
         _pairing.value = current.copy(approving = true)
         viewModelScope.launch {
             val controller = _activeController.value
-            val approved = try {
-                controller?.approveChallenge(current.challenge) == true
+            val result = try {
+                controller?.approveChallenge()
             } catch (c: CancellationException) {
                 throw c
             } catch (t: Throwable) {
-                false
+                null
             }
-            if (approved) {
+            if (result != null) {
                 _pairing.value = null
+                message("${current.peer.name} verified")
                 val queued = current.filesAfterApproval
-                val preview = controller?.isPairingPreview == true
-                if (queued.isNullOrEmpty()) {
-                    if (preview) {
-                        message("Preview PIN accepted — this device is not verified yet")
-                    } else {
-                        message("${current.peer.name} verified")
-                    }
-                } else {
+                if (!queued.isNullOrEmpty()) {
                     controller?.send(current.peer, queued)
                 }
             } else {
                 _pairing.value = current.copy(approving = false)
-                message("Verification expired. Try again.")
+                message("Couldn't verify ${current.peer.name}. Try again.")
             }
         }
     }
@@ -425,6 +426,7 @@ class AirBridgeViewModel(application: Application) : AndroidViewModel(applicatio
     fun dismissPairing() {
         if (_pairing.value?.approving == true) return
         _pairing.value = null
+        _activeController.value?.cancelPairing()
     }
 
     // ---------------------------------------------------------------- sheets

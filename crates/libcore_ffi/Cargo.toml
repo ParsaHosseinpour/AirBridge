@@ -33,6 +33,7 @@ default = []
 cli = ["uniffi/cli"]
 
 [dependencies]
+libcore_crypto = { path = "../libcore_crypto" }
 libcore_discovery = { path = "../libcore_discovery" }
 libcore_transport = { path = "../libcore_transport" }
 # The FFI crate owns a single multi-threaded runtime; every async export is

@@ -13,12 +13,11 @@ boundary, hand-written coroutine/event adapters, and both desktop and mobile
 applications.
 
 > [!IMPORTANT]
-> **Pairing is a preview in the current apps.** The Rust handshake in
-> `libcore_crypto` is implemented and tested, but `libcore_ffi` does not expose
-> it yet. Android and Windows therefore use a locally generated six-digit PIN
-> that does **not** authenticate the remote device, and transfers currently move
-> bytes over plain TCP without the handshake-derived AEAD. Use AirBridge on
-> trusted local networks and do not treat the PIN as proof of identity. See
+> **Transfers are encrypted and authenticated.** Every connection runs the
+> P-256 handshake exported by `libcore_ffi` before the file protocol starts;
+> payload frames are protected with directional AES-256-GCM keys. Both apps show
+> the real six-digit SAS from the handshake, and verified trust is stored against
+> the peer's identity-key fingerprint. See
 > [Security model and current limits](#security-model-and-current-limits).
 
 ## Contents
@@ -63,9 +62,9 @@ independent of any UI toolkit, executor, or operating system.
 
 | Layer | Language / runtime | Responsibility |
 | --- | --- | --- |
-| `libcore_crypto` | Rust, no async runtime | UKEY2-derived handshake, HKDF-SHA512 key schedule, AES-256-GCM frames, Short Authentication String (implemented; not yet exported through FFI) |
+| `libcore_crypto` | Rust, no async runtime | UKEY2-derived handshake, persistent P-256 identities, HKDF-SHA512 key schedule, AES-256-GCM frames, Short Authentication String |
 | `libcore_discovery` | Rust + Tokio | BLE beacons, mDNS/DNS-SD, concurrent subnet probe, tier coordination and peer table |
-| `libcore_transport` | Rust + Tokio | Length-prefixed framing, chunk grid, per-chunk SHA-256, crash-safe resume, verified commit |
+| `libcore_transport` | Rust + Tokio | Secure-channel handshake before `HELLO`, AEAD stream adapter, length-prefixed framing, chunk grid, per-chunk SHA-256, crash-safe resume, verified commit |
 | `libcore_ffi` | Rust + UniFFI 0.31 | Pull-based discovery/transfer engines and event streams for Kotlin and C#; owns the single multi-threaded Tokio runtime |
 | `bindings/kotlin` | Kotlin | Cold `Flow` adapters over the generated bindings |
 | `bindings/csharp` | C# / .NET 8 | Event pumps and the `AirBridge.Core` wrapper assembly |
@@ -326,9 +325,16 @@ cancellation semantics, and artifact verification.
 ```text
 M1  I -> R   ClientInit      version, random_c, suite, SHA-512 commitment to pk_c
 M2  R -> I   ServerInit      version, random_s, suite, SHA-512 commitment to pk_s
-M3  I -> R   ClientFinished  pk_c          (checked against the M1 commitment)
-M4  R -> I   ServerFinished  pk_s          (checked against the M2 commitment)
+M3  I -> R   ClientFinished  pk_c, identity_pk_c, signature_c
+M4  R -> I   ServerFinished  pk_s, identity_pk_s, signature_s
 ```
+
+The same four-message shape is used for transfers and for explicit pairing.
+`pk_c`/`pk_s` are still checked against the commitments from M1/M2.
+`signature_c`/`signature_s` cover the full transcript, the signer's ephemeral
+public key, and the signer's identity key, so each side proves possession of
+the long-lived identity bound to its fingerprint. The responder's transcript
+already contains the initiator's key, so its signature commits to both.
 
 Both parties then run P-256 ECDH and derive every session secret from the shared
 secret and the full transcript `M1 | M2 | M3 | M4` with HKDF-SHA512:
@@ -358,16 +364,17 @@ executor's threading model or cancellation semantics.
 
 Defended against:
 
-- passive eavesdroppers (all traffic is AEAD-protected once the handshake is
-  wired to the transport);
+- passive eavesdroppers (all traffic is AEAD-protected after the handshake);
 - active man-in-the-middle attackers (detected by SAS comparison);
-- message tampering and key substitution during the handshake (commitments);
+- message tampering and key substitution during the handshake (commitments and
+  identity signatures);
 - frame replay, reordering, reflection, and cross-session splicing.
 
 Explicitly not defended against:
 
-- peer **identity**: the crate authenticates a channel, not a person. Trust is
-  established by SAS comparison or an external credential;
+- **verified identity without the SAS**: the handshake proves possession of an
+  identity key and transports its fingerprint, but a user must still compare
+  the SAS (or an external credential) to bind that key to the person;
 - denial of service: a peer can always refuse to complete a handshake;
 - reordering networks: the replay policy is strict monotonic, not a sliding
   window. A transport that may deliver frames out of order must not use
@@ -446,29 +453,34 @@ backpressure instead of growing an unbounded queue.
 
 ## Security model and current limits
 
-AirBridge is local-first by design, but the current frontends are functional
-previews rather than a finished secure messenger:
+AirBridge is local-first by design and the transfer path is now encrypted and
+authenticated end to end:
 
-- **Preview pairing.** The Android `SasGateway` and Windows `ISasGateway` generate
-  a local six-digit PIN and do not exchange a commitment or nonce with the peer.
-  They do **not** authenticate the device and do **not** persist trust.
-- **Handshake not exported.** `libcore_crypto` is complete and tested, but
-  `libcore_ffi` only exports discovery and transfer sessions. The AEAD frame
-  layer is therefore not yet applied to app traffic.
-- **Plain TCP transport.** File bytes are chunk-checksummed for corruption
-  detection but are not encrypted or authenticated in the current build. Do not
-  use it for sensitive data or on untrusted networks.
-- **Anonymous inbound payloads.** The wire format carries no filename or sender
-  identity. Received files are staged in the app's private cache, shown for
-  consent, and committed under a generated name with an extension guessed from
-  content.
+- **Authenticated handshake.** Every TCP session runs the P-256 handshake before
+  `HELLO`. Each side signs the transcript with a persistent ECDSA P-256 identity
+  key, and HKDF-SHA512 derives directional AES-256-GCM keys from the ephemeral
+  shared secret and the full transcript.
+- **SAS confirmation.** The six-digit code shown by both apps comes from the
+  handshake, not from a local random generator. A man-in-the-middle cannot make
+  both legs display the same code except with probability 10⁻⁶.
+- **Fingerprint-based trust.** After approval, the peer's authenticated peer id
+  is bound to the SHA-256 fingerprint of its identity key. Later transfers pin
+  that key and auto-confirm only when the fingerprint is already trusted. Legacy
+  peer-id-only trust entries are discarded.
+- **Explicit pairing.** A pairing-only connection uses the same handshake and
+  port. The receiver surfaces the SAS, reports a verified device, and re-arms
+  without offering or saving a file.
+- **Anonymous payload metadata.** The wire format carries no filename. Received
+  files are staged in the app's private cache, shown for consent, and committed
+  under a generated name with an extension guessed from content. The sender's
+  authenticated peer id is available after the handshake.
 - **Firewall scope.** The Windows rules are limited to Private and Domain
   profiles; public networks stay blocked.
 
-When the handshake is exported, the intended flow is: both devices derive the
-same SAS, the user confirms the match out of band, and only then are directional
-AES-256-GCM keys released to the transport. Until that wiring exists, treat the
-PIN dialog as a UI preview only.
+Remaining limits: a peer that cannot complete the handshake is simply refused
+(denial of service is always possible), and trust on first use still requires
+the user to compare the SAS out of band. Replay protection is strict monotonic
+per connection, which matches the ordered TCP stream.
 
 ## Troubleshooting
 
@@ -489,12 +501,10 @@ Platform-specific details live in [`android/README.md`](android/README.md) and
 
 ## Roadmap
 
-- Export the `libcore_crypto` handshake and SAS through `libcore_ffi`.
-- Replace both preview gateways with a real SAS confirmation and persist trust.
-- Bind the AEAD frame layer to `libcore_transport` sessions.
 - Add `libcore_transfer`: multi-file manifests, queueing, and orchestration.
 - Extend bindings to iOS/macOS, where the `staticlib`/`dylib` artifacts already
   build.
+- Add an explicit device-management screen for revoking remembered fingerprints.
 
 ## Contributing
 

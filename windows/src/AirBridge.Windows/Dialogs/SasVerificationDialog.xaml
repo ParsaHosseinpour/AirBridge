@@ -7,8 +7,8 @@
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     mc:Ignorable="d"
     Style="{StaticResource AirBridgeDialogStyle}"
-    Title="Verify pairing"
-    PrimaryButtonText="PINs match"
+    Title="Verify device"
+    PrimaryButtonText="Codes match"
     CloseButtonText="Cancel"
     DefaultButton="None">
 
@@ -21,7 +21,11 @@
                 </Grid.ColumnDefinitions>
 
                 <Grid Width="54" Height="54">
-                    <Ellipse x:Name="PeerAvatar" Width="50" Height="50" Stroke="#2EFFFFFF" StrokeThickness="1.5" />
+                    <Ellipse Width="50"
+                             Height="50"
+                             Fill="#1A5AC8FA"
+                             Stroke="#2EFFFFFF"
+                             StrokeThickness="1.5" />
                     <FontIcon x:Name="PeerGlyph"
                               FontFamily="Segoe MDL2 Assets"
                               FontSize="20"
@@ -41,46 +45,12 @@
                 </StackPanel>
             </Grid>
 
-            <Border x:Name="PreviewPanel"
-                    Background="#16FFCF70"
-                    BorderBrush="#45FFCF70"
-                    BorderThickness="1"
-                    CornerRadius="14"
-                    Padding="12,10">
-                <Grid ColumnSpacing="10">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="*" />
-                    </Grid.ColumnDefinitions>
-
-                    <FontIcon Glyph="&#xE7BA;"
-                              FontFamily="Segoe MDL2 Assets"
-                              FontSize="16"
-                              Foreground="{StaticResource AirBridgeAmberBrush}"
-                              VerticalAlignment="Top"
-                              Margin="0,1,0,0" />
-
-                    <StackPanel Grid.Column="1" Spacing="2">
-                        <TextBlock Text="Preview pairing"
-                                   Style="{StaticResource BaseTextStyle}"
-                                   FontSize="12"
-                                   FontWeight="SemiBold"
-                                   Foreground="{StaticResource AirBridgeAmberBrush}" />
-                        <TextBlock x:Name="PreviewBodyText"
-                                   Text="This PIN is generated locally. It does not prove the other device's identity, and no trust is saved for this device."
-                                   Style="{StaticResource BaseTextStyle}"
-                                   FontSize="11.5"
-                                   Foreground="#D9FFE6B8"
-                                   TextWrapping="Wrap" />
-                    </StackPanel>
-                </Grid>
-            </Border>
-
             <TextBlock x:Name="InstructionText"
-                       Text="Ask the other device to open AirBridge. Both screens should show the same six-digit PIN."
+                       Text="Compare this code with the other device. Both screens must show the same six digits."
                        Style="{StaticResource BodyTextStyle}"
                        Foreground="{StaticResource AirBridgeMutedBrush}"
-                       FontSize="12.5" />
+                       FontSize="12.5"
+                       TextWrapping="Wrap" />
 
             <Border Background="#FF0A1522"
                     BorderBrush="#335AC8FA"
@@ -105,8 +75,30 @@
                 </StackPanel>
             </Border>
 
+            <Border Background="#14000000"
+                    BorderBrush="#1FFFFFFF"
+                    BorderThickness="1"
+                    CornerRadius="12"
+                    Padding="12,10">
+                <StackPanel Spacing="4">
+                    <TextBlock Text="IDENTITY KEY FINGERPRINT"
+                               Style="{StaticResource BaseTextStyle}"
+                               FontSize="10"
+                               FontWeight="SemiBold"
+                               Foreground="{StaticResource AirBridgeMutedBrush}"
+                               CharacterSpacing="80" />
+                    <TextBlock x:Name="FingerprintText"
+                               Text="—"
+                               FontFamily="Cascadia Mono, Consolas"
+                               FontSize="10.5"
+                               Foreground="#D9EAF4FF"
+                               TextWrapping="Wrap"
+                               IsTextSelectionEnabled="True" />
+                </StackPanel>
+            </Border>
+
             <TextBlock x:Name="FooterText"
-                       Text="Approve only if the PIN matches exactly. A mismatch can mean someone is intercepting the connection."
+                       Text="The code proves the encrypted session. Approving also remembers this device's key fingerprint, which is checked on every later transfer."
                        Style="{StaticResource BaseTextStyle}"
                        FontSize="11"
                        Foreground="{StaticResource AirBridgeMutedBrush}"
