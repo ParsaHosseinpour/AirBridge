@@ -57,7 +57,9 @@ independent of any UI toolkit, executor, or operating system.
 │ libcore_crypto    │ libcore_discovery     │ libcore_transport        │
 │ handshake, KDF,   │ BLE, mDNS/DNS-SD,     │ framing, 512 KiB chunks, │
 │ AEAD frames, SAS  │ /24 subnet fallback   │ SHA-256, resume state    │
-└───────────────────┴───────────────────────┴──────────────────────────┘
+├───────────────────┴───────────────────────┴──────────────────────────┤
+│ libcore_transfer   multi-file manifests, queueing, batch events      │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 | Layer | Language / runtime | Responsibility |
@@ -65,7 +67,8 @@ independent of any UI toolkit, executor, or operating system.
 | `libcore_crypto` | Rust, no async runtime | UKEY2-derived handshake, persistent P-256 identities, HKDF-SHA512 key schedule, AES-256-GCM frames, Short Authentication String |
 | `libcore_discovery` | Rust + Tokio | BLE beacons, mDNS/DNS-SD, concurrent subnet probe, tier coordination and peer table |
 | `libcore_transport` | Rust + Tokio | Secure-channel handshake before `HELLO`, AEAD stream adapter, length-prefixed framing, chunk grid, per-chunk SHA-256, crash-safe resume, verified commit |
-| `libcore_ffi` | Rust + UniFFI 0.31 | Pull-based discovery/transfer engines and event streams for Kotlin and C#; owns the single multi-threaded Tokio runtime |
+| `libcore_transfer` | Rust + Tokio | Multi-file manifest preamble, stable per-file payload ids, queue state machine, batch progress/ETA, sequential upload and receive orchestration |
+| `libcore_ffi` | Rust + UniFFI 0.31 | Pull-based discovery/transfer/batch engines and event streams for Kotlin and C#; owns the single multi-threaded Tokio runtime |
 | `bindings/kotlin` | Kotlin | Cold `Flow` adapters over the generated bindings |
 | `bindings/csharp` | C# / .NET 8 | Event pumps and the `AirBridge.Core` wrapper assembly |
 | `android/` | Kotlin, Compose, AGP 9 | Foreground service, BLE backend, MediaStore receive path, radar UI |
@@ -76,12 +79,13 @@ A typical transfer flows through the stack like this:
 1. The platform BLE backend and the Rust mDNS/subnet tiers produce sightings.
 2. `PeerDiscoveryEngine` deduplicates them into `PeerInfo` values keyed by a
    16-byte peer id and emits discovery events.
-3. The app opens a `FileTransferSession` for the selected peer and port.
-4. `libcore_transport` splits the file into checksummed chunks, resumes from the
-   receiver's verified offset, and commits only after the whole-file digest
-   matches.
-5. Transfer and progress events are drained on the foreign side and rendered in
-   the Compose or WinUI radar.
+3. The app opens a `FileTransferSession` for one file, or a
+   `BatchTransferSession` for a prepared multi-file manifest.
+4. `libcore_transport` splits each file into checksummed chunks, resumes from
+   the receiver's verified offset, and commits only after the whole-file digest
+   matches. `libcore_transfer` orders the manifest entries and tracks the queue.
+5. Transfer, batch and progress events are drained on the foreign side and
+   rendered in the Compose or WinUI radar.
 
 ## Repository layout
 
@@ -97,6 +101,7 @@ A typical transfer flows through the stack like this:
 │   ├── libcore_crypto/            handshake, KDF, AEAD framing, SAS, tests
 │   ├── libcore_discovery/         BLE, mDNS/DNS-SD, subnet scan, coordinator
 │   ├── libcore_transport/         framing, chunk engine, resume, verification
+│   ├── libcore_transfer/          multi-file manifests, queue, batch orchestration
 │   └── libcore_ffi/               UniFFI surface + one Tokio runtime
 ├── bindings/
 │   ├── kotlin/src/                Flow adapters over the generated bindings
@@ -505,7 +510,7 @@ Platform-specific details live in [`android/README.md`](android/README.md) and
 
 ## Roadmap
 
-- Add `libcore_transfer`: multi-file manifests, queueing, and orchestration.
+- Wire `BatchTransferSession` into the Android and Windows transfer queues.
 - Extend bindings to iOS/macOS, where the `staticlib`/`dylib` artifacts already
   build.
 

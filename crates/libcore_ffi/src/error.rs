@@ -239,6 +239,11 @@ impl From<TransferError> for FfiError {
             TransferError::PayloadMismatch { expected, received } => {
                 Self::PayloadMismatch { expected, received }
             }
+            TransferError::ContentMismatch => Self::ChecksumMismatch {
+                message: error_message(
+                    "the sender announced a payload that does not match the manifest",
+                ),
+            },
             TransferError::FileChecksumMismatch { .. } => Self::ChecksumMismatch {
                 message: error_message(
                     "the whole-file digest did not match the sender's announced digest",

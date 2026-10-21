@@ -8,14 +8,14 @@
 # | `libcore_discovery`   | BLE / mDNS / subnet peer discovery               | tokio   |
 # | `libcore_transport`   | length-prefixed framing, chunked resumable file  | tokio   |
 # |                       | transfer over TCP                                |         |
-# | `libcore_transfer`    | manifests, multi-peer orchestration (future)     | tokio   |
+# | `libcore_transfer`    | manifests, queueing, batch orchestration         | tokio   |
 # | `libcore_ffi`         | UniFFI boundary for Kotlin and C# bindings       | tokio   |
 #
 # `libcore_crypto` is deliberately runtime-agnostic. It is the crate that will
 # eventually sit inside the trusted computing base, so it must not inherit an
 # async executor's threading model, cancellation semantics, or dependency graph.
-# `tokio` is therefore pinned here at the workspace level for the transport and
-# discovery layers, but is *not* a dependency of the crypto core.
+# `tokio` is therefore pinned here at the workspace level for the transport,
+# transfer and discovery layers, but is *not* a dependency of the crypto core.
 #
 # The async crates carry their own `rust-version` rather than inheriting the
 # workspace floor: the crypto core keeps a deliberately old MSRV (it is
@@ -30,6 +30,7 @@ members = [
     "crates/libcore_crypto",
     "crates/libcore_discovery",
     "crates/libcore_transport",
+    "crates/libcore_transfer",
     "crates/libcore_ffi",
 ]
 
@@ -64,7 +65,7 @@ zeroize = { version = "1", default-features = false, features = ["alloc"] }
 aes-gcm = "0.10"
 
 # ---------------------------------------------------------------------------
-# Async runtime — transport and discovery layers only.
+# Async runtime — transport, transfer and discovery layers only.
 # ---------------------------------------------------------------------------
 tokio = { version = "1", default-features = false }
 

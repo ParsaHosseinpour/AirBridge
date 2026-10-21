@@ -46,8 +46,8 @@ use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex};
 
 use crate::cancel::{Canceller, WaitCancelled};
 use crate::crypto::{
-    exchange_peer_ids, parse_fingerprint, read_mode, validate_peer_id, write_mode, MODE_PAIRING,
-    MODE_TRANSFER,
+    exchange_peer_ids, parse_fingerprint, read_mode, validate_peer_id, write_mode,
+    PairingChallenge, MODE_BATCH, MODE_PAIRING, MODE_TRANSFER,
 };
 use crate::error::FfiError;
 use crate::runtime;
@@ -324,7 +324,7 @@ impl ReceiveOptions {
 }
 
 /// Validated identity, trust and deadline configuration.
-struct SecurityConfig {
+pub(crate) struct SecurityConfig {
     identity: Arc<Identity>,
     local_peer_id: String,
     expected_peer_fingerprint: Option<[u8; 32]>,
@@ -334,7 +334,7 @@ struct SecurityConfig {
 }
 
 impl SecurityConfig {
-    fn parse(
+    pub(crate) fn parse(
         identity_pkcs8: &[u8],
         local_peer_id: &str,
         trusted: &[String],
@@ -390,9 +390,24 @@ impl SecurityConfig {
 
 /// An explicit answer to [`TransferEvent::VerificationRequired`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PeerDecision {
+pub(crate) enum PeerDecision {
     Confirm,
     Reject,
+}
+
+/// Session-specific reactions to the shared authenticated handshake.
+///
+/// The handshake itself is identical for a single transfer, a pairing exchange
+/// and a batch; only the events and lifecycle labels differ. Implementations
+/// must be cheap and non-blocking: they run on a Tokio worker.
+pub(crate) trait AuthObserver: Send + Sync {
+    /// A SAS comparison is about to be requested.
+    fn set_verifying(&self);
+    /// The user must compare `challenge` and answer with `confirm_peer` or
+    /// `reject_peer`.
+    fn verification_required(&self, challenge: PairingChallenge);
+    /// The peer id is now bound to `peer_fingerprint`.
+    fn peer_verified(&self, peer_id: String, peer_fingerprint: String);
 }
 
 /// How the session was configured.
@@ -593,6 +608,12 @@ impl SessionInner {
         let peer_id = self.peer_id();
         let peer_fingerprint = self.peer_fingerprint();
 
+        if mode == MODE_BATCH {
+            return Err(FfiError::Protocol {
+                message: "the peer requested a batch on a single-file receiver".to_owned(),
+            });
+        }
+
         if mode == MODE_PAIRING {
             // A pairing connection carries no payload. Completing normally
             // lets a long-lived receiver re-arm without showing an offer.
@@ -659,147 +680,16 @@ impl SessionInner {
         stream: TcpStream,
         initiator: bool,
     ) -> Result<(SecureStream<TcpStream>, u8), FfiError> {
-        let timeout = self.security.handshake_timeout;
-        let identity = Arc::clone(&self.security.identity);
-        let handshake = async move {
-            if initiator {
-                core::initiate(stream, identity, timeout).await
-            } else {
-                core::respond(stream, identity, timeout).await
-            }
-        };
-
-        let pending = tokio::select! {
-            biased;
-            result = handshake => result?,
-            () = WaitCancelled(self.canceller.as_ref()) => return Err(FfiError::Cancelled),
-        };
-
-        let fingerprint = pending.peer_fingerprint().ok_or_else(|| FfiError::Crypto {
-            message: "the peer did not present an identity key".to_owned(),
-        })?;
-
-        if let Some(expected) = self.security.expected_peer_fingerprint {
-            if expected != fingerprint {
-                pending.reject();
-                return Err(FfiError::IdentityMismatch {
-                    expected: fingerprint_hex(&expected),
-                    actual: fingerprint_hex(&fingerprint),
-                });
-            }
-        }
-
-        let mut secure = if self.security.trusts(&fingerprint) {
-            pending.confirm()?
-        } else {
-            self.verify(pending, &fingerprint).await?
-        };
-
-        let exchange = async {
-            let peer_id = exchange_peer_ids(&mut secure, &self.security.local_peer_id).await?;
-            let mode = if initiator {
-                write_mode(&mut secure, MODE_TRANSFER).await?;
-                let echoed = read_mode(&mut secure).await?;
-                if echoed != MODE_TRANSFER {
-                    return Err(FfiError::Protocol {
-                        message: "the peer did not acknowledge transfer mode".to_owned(),
-                    });
-                }
-                MODE_TRANSFER
-            } else {
-                let requested = read_mode(&mut secure).await?;
-                write_mode(&mut secure, requested).await?;
-                requested
-            };
-            Ok::<_, FfiError>((peer_id, mode))
-        };
-
-        let (peer_id, mode) = tokio::select! {
-            biased;
-            result = exchange => result?,
-            () = WaitCancelled(self.canceller.as_ref()) => return Err(FfiError::Cancelled),
-        };
-
-        self.set_peer(peer_id, fingerprint);
-        Ok((secure, mode))
-    }
-
-    /// Shows the SAS and waits for the foreign UI's decision.
-    async fn verify(
-        &self,
-        pending: PendingConnection<TcpStream>,
-        fingerprint: &[u8; 32],
-    ) -> Result<SecureStream<TcpStream>, FfiError> {
-        let sas = pending.sas();
-        let challenge = TransferEvent::VerificationRequired {
-            sas: sas.to_padded_string(),
-            peer_fingerprint: fingerprint_hex(fingerprint),
-            peer_public_key: pending
-                .peer_identity_public_key()
-                .unwrap_or_default()
-                .to_vec(),
-        };
-
-        let (sender, receiver) = oneshot::channel();
-        {
-            let mut slot = lock(&self.decision);
-            if slot.is_some() {
-                pending.reject();
-                return Err(FfiError::Protocol {
-                    message: "a verification is already pending".to_owned(),
-                });
-            }
-            *slot = Some(sender);
-        }
-
-        self.set_status(TransferStatus::Verifying);
-        self.emit(challenge);
-
-        let decision = tokio::select! {
-            biased;
-            result = tokio::time::timeout(self.security.verification_timeout, receiver) => {
-                match result {
-                    Ok(Ok(decision)) => decision,
-                    // The sender was dropped without an answer.
-                    Ok(Err(_)) => PeerDecision::Reject,
-                    Err(_) => {
-                        lock(&self.decision).take();
-                        pending.reject();
-                        return Err(FfiError::Timeout {
-                            message: "waiting for the user to verify the peer".to_owned(),
-                        });
-                    }
-                }
-            }
-            () = WaitCancelled(self.canceller.as_ref()) => {
-                lock(&self.decision).take();
-                pending.reject();
-                return Err(FfiError::Cancelled);
-            }
-        };
-        lock(&self.decision).take();
-
-        match decision {
-            PeerDecision::Confirm => Ok(pending.confirm()?),
-            PeerDecision::Reject => {
-                pending.reject();
-                Err(FfiError::VerificationRejected)
-            }
-        }
-    }
-
-    /// Records and publishes the binding between fingerprint and peer id.
-    fn set_peer(&self, peer_id: String, fingerprint: [u8; 32]) {
-        let peer_fingerprint = fingerprint_hex(&fingerprint);
-        {
-            let mut state = lock(&self.state);
-            state.peer_id = Some(peer_id.clone());
-            state.peer_fingerprint = Some(peer_fingerprint.clone());
-        }
-        self.emit(TransferEvent::PeerVerified {
-            peer_id,
-            peer_fingerprint,
-        });
+        establish_authenticated(
+            stream,
+            initiator,
+            &self.security,
+            MODE_TRANSFER,
+            &self.canceller,
+            &self.decision,
+            self,
+        )
+        .await
     }
 
     fn peer_id(&self) -> Option<String> {
@@ -821,12 +711,7 @@ impl SessionInner {
     }
 
     fn answer_peer(&self, decision: PeerDecision) -> Result<(), FfiError> {
-        let sender = lock(&self.decision)
-            .take()
-            .ok_or_else(|| FfiError::invalid_argument("no peer verification is pending"))?;
-        sender
-            .send(decision)
-            .map_err(|_| FfiError::VerificationRejected)
+        answer_peer(&self.decision, decision)
     }
 
     /// Connects to the sender's chosen peer, observing cancellation.
@@ -856,6 +741,177 @@ impl SessionInner {
     }
 }
 
+impl AuthObserver for SessionInner {
+    fn set_verifying(&self) {
+        self.set_status(TransferStatus::Verifying);
+    }
+
+    fn verification_required(&self, challenge: PairingChallenge) {
+        self.emit(TransferEvent::VerificationRequired {
+            sas: challenge.sas,
+            peer_fingerprint: challenge.peer_fingerprint,
+            peer_public_key: challenge.peer_public_key,
+        });
+    }
+
+    fn peer_verified(&self, peer_id: String, peer_fingerprint: String) {
+        {
+            let mut state = lock(&self.state);
+            state.peer_id = Some(peer_id.clone());
+            state.peer_fingerprint = Some(peer_fingerprint.clone());
+        }
+        self.emit(TransferEvent::PeerVerified {
+            peer_id,
+            peer_fingerprint,
+        });
+    }
+}
+
+/// Runs the authenticated handshake and the post-handshake preamble.
+///
+/// Shared by the single-file transfer session and the batch session: the
+/// identity policy, SAS prompt, peer-id exchange and mode echo are identical;
+/// only the events and lifecycle labels differ, and those are delegated to
+/// `observer`.
+pub(crate) async fn establish_authenticated<O>(
+    stream: TcpStream,
+    initiator: bool,
+    security: &SecurityConfig,
+    requested_mode: u8,
+    canceller: &Canceller,
+    decision: &Mutex<Option<oneshot::Sender<PeerDecision>>>,
+    observer: &O,
+) -> Result<(SecureStream<TcpStream>, u8), FfiError>
+where
+    O: AuthObserver + ?Sized,
+{
+    let timeout = security.handshake_timeout;
+    let identity = Arc::clone(&security.identity);
+    let handshake = async move {
+        if initiator {
+            core::initiate(stream, identity, timeout).await
+        } else {
+            core::respond(stream, identity, timeout).await
+        }
+    };
+
+    let pending = tokio::select! {
+        biased;
+        result = handshake => result?,
+        () = WaitCancelled(canceller) => return Err(FfiError::Cancelled),
+    };
+
+    let fingerprint = pending.peer_fingerprint().ok_or_else(|| FfiError::Crypto {
+        message: "the peer did not present an identity key".to_owned(),
+    })?;
+
+    if let Some(expected) = security.expected_peer_fingerprint {
+        if expected != fingerprint {
+            pending.reject();
+            return Err(FfiError::IdentityMismatch {
+                expected: fingerprint_hex(&expected),
+                actual: fingerprint_hex(&fingerprint),
+            });
+        }
+    }
+
+    let mut secure = if security.trusts(&fingerprint) {
+        pending.confirm()?
+    } else {
+        verify_pending(pending, security, canceller, decision, observer).await?
+    };
+
+    let exchange = async {
+        let peer_id = exchange_peer_ids(&mut secure, &security.local_peer_id).await?;
+        let mode = if initiator {
+            write_mode(&mut secure, requested_mode).await?;
+            let echoed = read_mode(&mut secure).await?;
+            if echoed != requested_mode {
+                return Err(FfiError::Protocol {
+                    message: format!(
+                        "the peer did not acknowledge application mode {requested_mode:#04x}"
+                    ),
+                });
+            }
+            requested_mode
+        } else {
+            let requested = read_mode(&mut secure).await?;
+            write_mode(&mut secure, requested).await?;
+            requested
+        };
+        Ok::<_, FfiError>((peer_id, mode))
+    };
+
+    let (peer_id, mode) = tokio::select! {
+        biased;
+        result = exchange => result?,
+        () = WaitCancelled(canceller) => return Err(FfiError::Cancelled),
+    };
+
+    observer.peer_verified(peer_id, fingerprint_hex(&fingerprint));
+    Ok((secure, mode))
+}
+
+/// Shows the SAS and waits for the foreign UI's decision.
+async fn verify_pending<O>(
+    pending: PendingConnection<TcpStream>,
+    security: &SecurityConfig,
+    canceller: &Canceller,
+    decision: &Mutex<Option<oneshot::Sender<PeerDecision>>>,
+    observer: &O,
+) -> Result<SecureStream<TcpStream>, FfiError>
+where
+    O: AuthObserver + ?Sized,
+{
+    let challenge = crate::crypto::challenge_from(&pending)?;
+
+    let (sender, receiver) = oneshot::channel();
+    {
+        let mut slot = lock(decision);
+        if slot.is_some() {
+            pending.reject();
+            return Err(FfiError::Protocol {
+                message: "a verification is already pending".to_owned(),
+            });
+        }
+        *slot = Some(sender);
+    }
+
+    observer.set_verifying();
+    observer.verification_required(challenge);
+
+    let answer = tokio::select! {
+        biased;
+        result = tokio::time::timeout(security.verification_timeout, receiver) => {
+            match result {
+                Ok(Ok(answer)) => answer,
+                // The sender was dropped without an answer.
+                Ok(Err(_)) => PeerDecision::Reject,
+                Err(_) => {
+                    lock(decision).take();
+                    pending.reject();
+                    return Err(FfiError::Timeout {
+                        message: "waiting for the user to verify the peer".to_owned(),
+                    });
+                }
+            }
+        }
+        () = WaitCancelled(canceller) => {
+            lock(decision).take();
+            pending.reject();
+            return Err(FfiError::Cancelled);
+        }
+    };
+    lock(decision).take();
+
+    match answer {
+        PeerDecision::Confirm => Ok(pending.confirm()?),
+        PeerDecision::Reject => {
+            pending.reject();
+            Err(FfiError::VerificationRejected)
+        }
+    }
+}
 /// One bounded transfer over one connection.
 ///
 /// Construct with [`Self::send`] or [`Self::receive`], then call
@@ -1094,9 +1150,22 @@ impl FileTransferSession {
     }
 }
 
+/// Delivers an explicit answer to a pending SAS prompt.
+pub(crate) fn answer_peer(
+    slot: &Mutex<Option<oneshot::Sender<PeerDecision>>>,
+    decision: PeerDecision,
+) -> Result<(), FfiError> {
+    let sender = lock(slot)
+        .take()
+        .ok_or_else(|| FfiError::invalid_argument("no peer verification is pending"))?;
+    sender
+        .send(decision)
+        .map_err(|_| FfiError::VerificationRejected)
+}
+
 /// Rejects empty endpoints; syntax errors surface from bind/connect as I/O
 /// errors with the platform's own message.
-fn validate_endpoint(address: &str, path: &str) -> Result<(), FfiError> {
+pub(crate) fn validate_endpoint(address: &str, path: &str) -> Result<(), FfiError> {
     if address.trim().is_empty() {
         return Err(FfiError::invalid_argument("address must not be empty"));
     }
@@ -1107,7 +1176,7 @@ fn validate_endpoint(address: &str, path: &str) -> Result<(), FfiError> {
 }
 
 /// Clamps a requested progress interval to something a channel can absorb.
-fn throttled_interval(requested_ms: u64) -> u64 {
+pub(crate) fn throttled_interval(requested_ms: u64) -> u64 {
     requested_ms.max(MIN_PROGRESS_INTERVAL_MS)
 }
 

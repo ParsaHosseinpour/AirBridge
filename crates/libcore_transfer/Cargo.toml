@@ -1,0 +1,29 @@
+[package]
+name = "libcore_transfer"
+description = "AirBridge multi-file transfer orchestration: canonical manifests, a queue state machine, and batch upload/receive over one authenticated stream."
+version.workspace = true
+edition.workspace = true
+# tokio 1.x MSRV. Declared per crate so `libcore_crypto` keeps its own,
+# deliberately older floor.
+rust-version = "1.71"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories = ["network-programming", "filesystem"]
+keywords = ["p2p", "batch", "manifest", "queue", "transfer"]
+
+[dependencies]
+# Filesystem access, the duplex test transport, and `watch` channels for ack
+# routing. No networking is opened here: the caller supplies the authenticated
+# stream, which keeps this crate independent of the crypto layer.
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
+# SHA-256 for manifest hashing and file preparation. Same root of trust as the
+# transport and crypto cores.
+ring.workspace = true
+libcore_transport = { path = "../libcore_transport" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

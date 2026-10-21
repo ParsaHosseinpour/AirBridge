@@ -51,6 +51,16 @@ pub struct ReceiveOptions {
     /// Set this when the caller knows which transfer it asked for; leave it
     /// `None` to accept whatever arrives first.
     pub expected_payload_id: Option<PayloadId>,
+    /// Reject a `HELLO` announcing a different payload size.
+    ///
+    /// The multi-file layer sets this from the authenticated manifest before
+    /// the sender's `HELLO` arrives.
+    pub expected_total_len: Option<u64>,
+    /// Reject a `HELLO` announcing a different whole-file SHA-256.
+    ///
+    /// Like [`Self::expected_total_len`], this lets an outer manifest bind the
+    /// per-file header to content that was agreed before the transfer started.
+    pub expected_file_sha256: Option<[u8; 32]>,
     /// How many verified bytes may accumulate before a progress ack is sent.
     ///
     /// This bounds how far a sender can run ahead of the receiver's persisted
@@ -72,6 +82,8 @@ impl ReceiveOptions {
     pub const fn new() -> Self {
         Self {
             expected_payload_id: None,
+            expected_total_len: None,
+            expected_file_sha256: None,
             ack_every_bytes: 4 * 1024 * 1024,
             verify_file_sha256: true,
         }
@@ -81,6 +93,20 @@ impl ReceiveOptions {
     #[must_use]
     pub const fn with_expected_payload_id(mut self, payload_id: PayloadId) -> Self {
         self.expected_payload_id = Some(payload_id);
+        self
+    }
+
+    /// Requires a specific payload size.
+    #[must_use]
+    pub const fn with_expected_total_len(mut self, total_len: u64) -> Self {
+        self.expected_total_len = Some(total_len);
+        self
+    }
+
+    /// Requires a specific whole-file SHA-256.
+    #[must_use]
+    pub const fn with_expected_file_sha256(mut self, digest: [u8; 32]) -> Self {
+        self.expected_file_sha256 = Some(digest);
         self
     }
 
@@ -140,10 +166,84 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
+    receive_file_inner(
+        &mut reader,
+        &mut writer,
+        destination,
+        options,
+        &mut |_bytes: u64| {},
+    )
+    .await
+}
+
+/// Receives one payload over a borrowed stream, leaving the stream open.
+///
+/// This is the multi-file entry point: a batch sends a manifest once, then
+/// calls this function for each entry in order without renegotiating the
+/// transport or the secure channel. The stream position is advanced exactly
+/// past the `COMPLETE` frame.
+///
+/// # Errors
+///
+/// Same as [`receive_file`].
+pub async fn receive_file_mut<S>(
+    stream: &mut S,
+    destination: &Path,
+    options: &ReceiveOptions,
+) -> Result<ReceiveReport, TransferError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    receive_file_mut_with_progress(stream, destination, options, |_bytes| {}).await
+}
+
+/// Like [`receive_file_mut`], but reports the contiguous verified offset after
+/// every accepted chunk.
+///
+/// The callback receives the cumulative number of verified bytes for this
+/// payload, including the resumed prefix. It is invoked on the transfer task
+/// and must return quickly; use it to coalesce progress, not to perform I/O.
+///
+/// # Errors
+///
+/// Same as [`receive_file`].
+pub async fn receive_file_mut_with_progress<S, F>(
+    stream: &mut S,
+    destination: &Path,
+    options: &ReceiveOptions,
+    mut progress: F,
+) -> Result<ReceiveReport, TransferError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: FnMut(u64),
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    receive_file_inner(
+        &mut reader,
+        &mut writer,
+        destination,
+        options,
+        &mut progress,
+    )
+    .await
+}
+
+async fn receive_file_inner<R, W, P>(
+    reader: &mut R,
+    writer: &mut W,
+    destination: &Path,
+    options: &ReceiveOptions,
+    progress: &mut P,
+) -> Result<ReceiveReport, TransferError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    P: FnMut(u64),
+{
     let mut buffer = FrameBuffer::new();
 
     // 1. HELLO.
-    let hello = match read_frame(&mut reader, &mut buffer).await? {
+    let hello = match read_frame(reader, &mut buffer).await? {
         Frame::Hello(hello) => hello,
         Frame::Abort(abort) => return Err(TransferError::PeerAborted { code: abort.code }),
         _ => return Err(TransferError::Protocol("the sender must open with HELLO")),
@@ -152,7 +252,7 @@ where
     if let Some(expected) = options.expected_payload_id {
         if expected != hello.payload_id {
             let _ = write_abort(
-                &mut writer,
+                writer,
                 &Abort {
                     payload_id: hello.payload_id,
                     code: AbortCode::Unsupported,
@@ -165,6 +265,23 @@ where
             });
         }
     }
+    if options
+        .expected_total_len
+        .is_some_and(|expected| expected != hello.total_len)
+        || options
+            .expected_file_sha256
+            .is_some_and(|expected| hello.file_sha256 != Some(expected))
+    {
+        let _ = write_abort(
+            writer,
+            &Abort {
+                payload_id: hello.payload_id,
+                code: AbortCode::Unsupported,
+            },
+        )
+        .await;
+        return Err(TransferError::ContentMismatch);
+    }
 
     // 2. Reconcile with whatever survived the previous attempt.
     let part = part_path(destination);
@@ -172,10 +289,13 @@ where
     let (mut file, mut offset, mut hasher) =
         open_resume(&part, &state_path, &hello, &plan, options).await?;
     let resumed_from = offset;
+    if resumed_from > 0 {
+        progress(resumed_from);
+    }
 
     // 3. The opening ack: the sender starts exactly here.
     write_ack_offset(
-        &mut writer,
+        writer,
         &AckOffset {
             payload_id: hello.payload_id,
             offset,
@@ -198,13 +318,14 @@ where
         )
         .await?;
         write_complete(
-            &mut writer,
+            writer,
             &Complete {
                 payload_id: hello.payload_id,
                 total_len: hello.total_len,
             },
         )
         .await?;
+        progress(hello.total_len);
         return Ok(ReceiveReport {
             payload_id: hello.payload_id,
             total_len: hello.total_len,
@@ -217,14 +338,14 @@ where
     let mut unacked = 0_u64;
 
     loop {
-        match read_frame(&mut reader, &mut buffer).await? {
+        match read_frame(reader, &mut buffer).await? {
             Frame::Payload(payload) => {
                 let header = payload.header;
                 let data = payload.data;
 
                 if header.payload_id != hello.payload_id {
                     return abort_with(
-                        &mut writer,
+                        writer,
                         hello.payload_id,
                         AbortCode::ProtocolViolation,
                         "chunk belongs to a different payload",
@@ -233,7 +354,7 @@ where
                 }
                 if !plan.is_aligned(header.offset) {
                     return abort_with(
-                        &mut writer,
+                        writer,
                         hello.payload_id,
                         AbortCode::ProtocolViolation,
                         "chunk offset is not aligned to the chunk grid",
@@ -242,7 +363,7 @@ where
                 }
                 if data.len() > plan.chunk_size() as usize {
                     return abort_with(
-                        &mut writer,
+                        writer,
                         hello.payload_id,
                         AbortCode::ProtocolViolation,
                         "chunk exceeds the negotiated chunk size",
@@ -258,7 +379,7 @@ where
                         ))?;
                 if end > hello.total_len {
                     return abort_with(
-                        &mut writer,
+                        writer,
                         hello.payload_id,
                         AbortCode::ProtocolViolation,
                         "chunk extends past the end of the payload",
@@ -276,7 +397,7 @@ where
                     // The sender is ahead of what we can accept; ask for the
                     // bytes we actually need.
                     write_ack_offset(
-                        &mut writer,
+                        writer,
                         &AckOffset {
                             payload_id: hello.payload_id,
                             offset,
@@ -291,7 +412,7 @@ where
                 // prefix. This is the only path that advances state.
                 if chunk_sha256(data) != header.checksum {
                     write_ack_offset(
-                        &mut writer,
+                        writer,
                         &AckOffset {
                             payload_id: hello.payload_id,
                             offset,
@@ -306,6 +427,7 @@ where
                 hasher.update(data);
                 offset = end;
                 unacked += data.len() as u64;
+                progress(offset);
 
                 if unacked >= ack_every {
                     // Persist before acknowledging: a receiver that crashes
@@ -313,7 +435,7 @@ where
                     // same offset.
                     persist_state(&state_path, &hello, offset, &hasher).await?;
                     write_ack_offset(
-                        &mut writer,
+                        writer,
                         &AckOffset {
                             payload_id: hello.payload_id,
                             offset,
@@ -337,7 +459,7 @@ where
                     )
                     .await?;
                     write_complete(
-                        &mut writer,
+                        writer,
                         &Complete {
                             payload_id: hello.payload_id,
                             total_len: hello.total_len,
@@ -355,7 +477,7 @@ where
             Frame::Abort(abort) => return Err(TransferError::PeerAborted { code: abort.code }),
             Frame::Hello(_) => {
                 return abort_with(
-                    &mut writer,
+                    writer,
                     hello.payload_id,
                     AbortCode::ProtocolViolation,
                     "sender sent a second HELLO",
@@ -364,7 +486,7 @@ where
             }
             Frame::AckOffset(_) | Frame::Complete(_) => {
                 return abort_with(
-                    &mut writer,
+                    writer,
                     hello.payload_id,
                     AbortCode::ProtocolViolation,
                     "sender sent a frame only a receiver may send",

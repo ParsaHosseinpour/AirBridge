@@ -36,6 +36,7 @@ cli = ["uniffi/cli"]
 libcore_crypto = { path = "../libcore_crypto" }
 libcore_discovery = { path = "../libcore_discovery" }
 libcore_transport = { path = "../libcore_transport" }
+libcore_transfer = { path = "../libcore_transfer" }
 # The FFI crate owns a single multi-threaded runtime; every async export is
 # spawned onto it, so foreign executors (Kotlin coroutines, .NET Tasks) only
 # ever poll a JoinHandle. `macros` is needed for `select!`.

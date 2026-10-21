@@ -1,8 +1,8 @@
 # libcore_ffi
 
-The AirBridge FFI boundary. It exposes peer discovery and resumable file
-transfer to Kotlin (coroutine flows) and C# (tasks and events) through
-[UniFFI](https://mozilla.github.io/uniffi-rs/) 0.31.
+The AirBridge FFI boundary. It exposes peer discovery, resumable file
+transfer and multi-file batches to Kotlin (coroutine flows) and C# (tasks and
+events) through [UniFFI](https://mozilla.github.io/uniffi-rs/) 0.31.
 
 The library name is `core_ffi`, so the artifacts are:
 
@@ -13,11 +13,11 @@ The library name is `core_ffi`, so the artifacts are:
 | iOS/macOS| `libcore_ffi.a`/`libcore_ffi.dylib` (for a future binding) |
 
 This crate is deliberately thin. It contains no protocol logic: it wraps
-`libcore_discovery` and `libcore_transport`, adapts their types to the FFI,
-and owns the one Tokio runtime the async exports need. Every hand-written
-line in `src/` is safe Rust; the only `unsafe` in the crate is what UniFFI's
-generated scaffolding requires (the workspace-level `unsafe_code = "forbid"`
-is overridden locally for exactly that reason).
+`libcore_discovery`, `libcore_transport` and `libcore_transfer`, adapts their
+types to the FFI, and owns the one Tokio runtime the async exports need. Every
+hand-written line in `src/` is safe Rust; the only `unsafe` in the crate is
+what UniFFI's generated scaffolding requires (the workspace-level
+`unsafe_code = "forbid"` is overridden locally for exactly that reason).
 
 ## Surface
 
@@ -25,17 +25,20 @@ is overridden locally for exactly that reason).
 |--------------------------------|-------------------|-------------------------------------|
 | `PeerDiscoveryEngine`          | object            | `PeerDiscoveryEngine`                |
 | `FileTransferSession`          | object            | `FileTransferSession`                |
+| `BatchTransferSession`         | object            | `BatchTransferSession`               |
 | `BleBackend`                   | foreign trait     | interface to implement on the platform |
 | `BleObservationSink`           | object (Rust)     | handed to the `BleBackend` implementation |
 | `BleRequest`                   | record            | value                                |
 | `DiscoveryConfig`, `PeerInfo`  | records           | value                                |
 | `SendOptions`, `ReceiveOptions`, `TransferReport` | records | value                       |
-| `DiscoveryEvent`, `TransferEvent` | enums          | sealed classes / records             |
+| `BatchOptions`, `BatchItemInfo`, `BatchSnapshot`, `BatchReport` | records | value |
+| `DiscoveryEvent`, `TransferEvent`, `BatchEvent` | enums | sealed classes / records       |
 | `TierState`, `DiscoveryTier`, `SubnetPolicy`, `TransferDirection`, `TransferStatus`, `AbortReason` | enums | value enums |
+| `BatchPhase`, `BatchItemStatus` | enums            | value enums                          |
 | `FfiError`                     | error enum        | exception hierarchy                  |
 
-Both engines are pull-based: `nextEvent()` resolves to the next event, or
-`None` once the underlying stream is closed. The hand-written adapters in
+All session engines are pull-based: `nextEvent()` resolves to the next event,
+or `None` once the underlying stream is closed. The hand-written adapters in
 `bindings/` turn that into what each platform expects:
 
 | platform | adapter                          | result                          |
@@ -51,6 +54,37 @@ keeps all foreign execution on the foreign executor and gives the consumer
 natural backpressure: the next event is requested only after the previous
 one was handled.
 
+## Batch sessions
+
+`BatchTransferSession` reuses the same handshake and the same per-file
+transport engine, but writes one authenticated manifest first and then runs
+the files in manifest order over that connection:
+
+1. Create a sender with `send(address, BatchOptions)` or a receiver with
+   `receive(listenAddress, destination, BatchOptions)`.
+2. Add files with `addFile(path, relativePath)` or `addDirectory(directory)`.
+   Files are hashed immediately; duplicates and unsafe relative paths are
+   rejected before the session starts. A sender's batch id is fixed at
+   construction — random unless `BatchOptions.batchId` pins one — while a
+   receiver learns the sender's id from the manifest.
+3. Call `run()` once and drain `nextEvent()` concurrently. `Started` announces
+   the manifest totals, `FileStarted`/`FileCompleted`/`FileFailed` describe
+   items, `Progress` is throttled overall progress (including the current file
+   index, remaining bytes and an ETA), and exactly one terminal
+   `Finished`/`Failed`/`Cancelled` closes the stream.
+4. Read `snapshot()` at any time for the live queue: pending/active/completed/
+   failed counts, per-item status and bytes, and the current file index. It is
+   authoritative even if the event consumer falls behind (`Lagged` says how
+   many events were skipped).
+
+A receiver keeps part files and sidecars from an interrupted batch, so a
+retry with the same manifest resumes each entry from its verified offset.
+With `continueOnError = false`, the first failed item stops the batch; entries
+that were never attempted are reported as `Cancelled` rather than left
+pending. The same `VerificationRequired` / `PeerVerified` events and
+`confirmPeer`/`rejectPeer` methods as a single-file session handle first-use
+trust.
+
 ## Concurrency model
 
 * **One runtime, owned here.** `src/runtime.rs` lazily creates a single
@@ -62,8 +96,8 @@ one was handled.
   performs I/O on the foreign scheduler.
 * **Dropping a foreign future detaches, it does not stop.** A cancelled
   Kotlin `await` or a disposed .NET task leaves the spawned Rust task
-  running. Stopping work is explicit: `FileTransferSession.cancel()` or
-  `PeerDiscoveryEngine.stop()`.
+  running. Stopping work is explicit: `FileTransferSession.cancel()`,
+  `BatchTransferSession.cancel()` or `PeerDiscoveryEngine.stop()`.
 * **The BLE trait is the one Rust-to-foreign direction.** `BleBackend.start`,
   `stop` and `isRunning` are invoked from Tokio workers (and `observe` from
   whatever thread the platform radio uses). Implementations must be
@@ -79,11 +113,12 @@ one was handled.
 
 UniFFI has no built-in cancellation, so it is explicit:
 
-* `FileTransferSession.cancel()` flips a flag and wakes the poll currently
-  suspended on the socket (`src/cancel.rs`). The wrapped stream then fails
-  its next poll, the transport unwinds through its normal error path — its
-  ack pump is aborted, the receiver's part file and sidecar survive — and
-  `run()` resolves to `FfiError::Cancelled`.
+* `FileTransferSession.cancel()` or `BatchTransferSession.cancel()` flips a
+  flag and wakes the poll currently suspended on the socket
+  (`src/cancel.rs`). The wrapped stream then fails its next poll, the
+  transport unwinds through its normal error path — its ack pump is aborted,
+  the receiver's part file and sidecar survive — and `run()` resolves to
+  `FfiError::Cancelled` after publishing the terminal `Cancelled` event.
 * `PeerDiscoveryEngine.stop()` asks the coordinator to shut all tiers down.
   It is non-blocking and idempotent; the coordinator publishes
   `DiscoveryEvent::Shutdown` and only then closes the stream, so a UI that
@@ -106,11 +141,11 @@ Only owned, copyable values cross the boundary:
 * **Payload bytes never cross.** A transfer reads the file on the Rust side
   and moves it between sockets; progress is a pair of integers, and events
   carry metadata only.
-* **Records are copies, objects are shared handles.** A `PeerInfo` or a
-  `TransferReport` is a value: mutating your copy cannot affect the engine.
-  An object (`PeerDiscoveryEngine`, `FileTransferSession`,
-  `BleObservationSink`) is a reference-counted handle; the Kotlin cleaner or
-  the C# finalizer releases one Rust reference.
+* **Records are copies, objects are shared handles.** A `PeerInfo`, a
+  `TransferReport` or a `BatchSnapshot` is a value: mutating your copy cannot
+  affect the engine. An object (`PeerDiscoveryEngine`, `FileTransferSession`,
+  `BatchTransferSession`, `BleObservationSink`) is a reference-counted handle;
+  the Kotlin cleaner or the C# finalizer releases one Rust reference.
 * **Peer ids and paths are strings.** A peer id crosses as 32 lowercase hex
   digits, not as bytes: Kotlin `ByteArray` breaks `data class` equality and
   C# `byte[]` compares by reference, so an id kept as a byte array would

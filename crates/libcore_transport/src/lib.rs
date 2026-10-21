@@ -114,7 +114,9 @@ pub use frame::{
     PayloadHeader, PayloadId, ABORT_BODY_LEN, ACK_BODY_LEN, COMPLETE_BODY_LEN, HELLO_BODY_LEN,
     LENGTH_PREFIX_LEN, MAX_FRAME_BODY, PAYLOAD_HEADER_LEN,
 };
-pub use receiver::{receive_file, ReceiveOptions, ReceiveReport};
+pub use receiver::{
+    receive_file, receive_file_mut, receive_file_mut_with_progress, ReceiveOptions, ReceiveReport,
+};
 pub use secure::{connect_secure, initiate, respond, PendingConnection, SecureStream};
 pub use sender::{upload_file, UploadOptions, UploadReport};
 pub use state::{part_path, state_path_for, ResumeState, STATE_LEN, STATE_MAGIC, STATE_VERSION};

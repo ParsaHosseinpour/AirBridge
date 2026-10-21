@@ -771,9 +771,19 @@ version = "0.1.0"
 dependencies = [
  "libcore_crypto",
  "libcore_discovery",
+ "libcore_transfer",
  "libcore_transport",
  "tokio",
  "uniffi",
+]
+
+[[package]]
+name = "libcore_transfer"
+version = "0.1.0"
+dependencies = [
+ "libcore_transport",
+ "ring",
+ "tokio",
 ]
 
 [[package]]

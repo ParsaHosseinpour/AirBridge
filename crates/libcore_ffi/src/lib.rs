@@ -8,6 +8,7 @@
 
 uniffi::setup_scaffolding!();
 
+mod batch;
 mod ble;
 mod cancel;
 mod crypto;
@@ -16,6 +17,10 @@ mod error;
 mod runtime;
 mod transfer;
 
+pub use batch::{
+    BatchEvent, BatchItemInfo, BatchItemStatus, BatchOptions, BatchPhase, BatchReport,
+    BatchSnapshot, BatchTransferSession,
+};
 pub use ble::{BleBackend, BleObservationSink, BleRequest};
 pub use crypto::{PairingChallenge, PairingResult, PairingSession, PeerIdentity};
 pub use discovery::{

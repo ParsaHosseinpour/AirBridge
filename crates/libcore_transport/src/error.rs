@@ -36,6 +36,14 @@ pub enum TransferError {
         received: u64,
     },
 
+    /// The sender announced a size or digest that does not match the value the
+    /// receiver was told to expect.
+    ///
+    /// This is used by the multi-file layer: the manifest is authenticated
+    /// separately, so a `HELLO` that disagrees with it is a protocol error
+    /// even though the per-file transfer is otherwise well formed.
+    ContentMismatch,
+
     /// A chunk offset lies outside the file, or is not aligned to the chunk
     /// grid.
     OffsetOutOfRange {
@@ -111,6 +119,9 @@ impl fmt::Display for TransferError {
                 f,
                 "payload id mismatch: expected {expected:016x}, received {received:016x}"
             ),
+            Self::ContentMismatch => {
+                f.write_str("the announced payload does not match the expected manifest entry")
+            }
             Self::OffsetOutOfRange { offset, total_len } => write!(
                 f,
                 "chunk offset {offset} is out of range for a {total_len}-byte payload"

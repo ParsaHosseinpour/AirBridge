@@ -19,7 +19,7 @@
 //! ```text
 //! initiator -> responder   peer_id (u16 length + UTF-8)
 //! responder -> initiator   peer_id
-//! initiator -> responder   mode: 0x01 transfer | 0x02 pairing
+//! initiator -> responder   mode: 0x01 transfer | 0x02 pairing | 0x03 batch
 //! responder -> initiator   mode echo
 //! ```
 //!
@@ -46,6 +46,9 @@ pub(crate) const MODE_TRANSFER: u8 = 0x01;
 
 /// Application mode for a pairing-only connection.
 pub(crate) const MODE_PAIRING: u8 = 0x02;
+
+/// Application mode for a multi-file batch connection.
+pub(crate) const MODE_BATCH: u8 = 0x03;
 
 /// Timeout applied to the post-handshake peer id and mode exchange.
 const PREAMBLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -378,7 +381,7 @@ where
             message: "waiting for the peer's application mode".to_owned(),
         })??;
     match mode[0] {
-        MODE_TRANSFER | MODE_PAIRING => Ok(mode[0]),
+        MODE_TRANSFER | MODE_PAIRING | MODE_BATCH => Ok(mode[0]),
         _ => Err(FfiError::Protocol {
             message: "the peer requested an unknown application mode".to_owned(),
         }),
